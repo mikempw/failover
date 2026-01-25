@@ -1,0 +1,131 @@
+# Docker Compose for LOCAL TESTING
+#
+# Simulates both Primary and DR sites on one machine
+# Uses dry-run provider (no real DNS needed)
+#
+# Usage:
+#   docker-compose -f docker-compose.test.yaml up --build
+#
+# What it does:
+#   1. Primary renews DNS lease every 10s
+#   2. DR monitors primary health
+#   3. OTEL watcher watches DNS state file
+#   4. When you stop primary, DR takes over, OTEL "starts"
+#
+# Test failover:
+#   docker-compose -f docker-compose.test.yaml stop primary
+#   (wait ~30s for lease to expire)
+#   docker-compose -f docker-compose.test.yaml logs -f dr otel-watcher
+#
+# Test failback:
+#   docker-compose -f docker-compose.test.yaml start primary
+#   docker-compose -f docker-compose.test.yaml exec primary python3 /app/dns_failover.py failback
+
+version: '3.8'
+
+services:
+  # ===================
+  # PRIMARY SITE
+  # ===================
+  primary:
+    build: .
+    container_name: dns-failover-primary
+    environment:
+      - ROLE=primary
+      - DNS_PROVIDER=dry-run
+      - DNS_ZONE=example.local
+      - DNS_RECORD=syslog.example.local
+      - DNS_TTL=30
+      - PRIMARY_IP=10.10.10.10
+      - DR_IP=10.20.20.20
+      - LEASE_TTL=30
+      - UPDATE_INTERVAL=5
+      - FAIL_THRESHOLD=3
+      - HEALTH_HOST=primary
+      - HEALTH_PORT=9999
+      - DRYRUN_STATEFILE=/shared/zone.json
+    volumes:
+      - shared-state:/shared
+    # Expose a fake health port for DR to check
+    command: >
+      sh -c "
+        echo 'Starting health endpoint on port 9999...' &&
+        (while true; do echo -e 'HTTP/1.1 200 OK\r\n\r\nOK' | nc -l -p 9999 -q 1; done) &
+        python3 /app/dns_failover.py run
+      "
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9999"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+
+  # Simulated Primary OTEL (always on in real setup)
+  primary-otel:
+    image: alpine
+    container_name: otel-primary
+    command: >
+      sh -c "
+        echo '[PRIMARY OTEL] Running - scraping BIG-IPs...' &&
+        while true; do
+          echo '[PRIMARY OTEL] Collecting metrics...'
+          sleep 10
+        done
+      "
+
+  # ===================
+  # DR SITE  
+  # ===================
+  dr:
+    build: .
+    container_name: dns-failover-dr
+    environment:
+      - ROLE=dr
+      - DNS_PROVIDER=dry-run
+      - DNS_ZONE=example.local
+      - DNS_RECORD=syslog.example.local
+      - DNS_TTL=30
+      - PRIMARY_IP=10.10.10.10
+      - DR_IP=10.20.20.20
+      - LEASE_TTL=30
+      - UPDATE_INTERVAL=5
+      - FAIL_THRESHOLD=3
+      - HEALTH_HOST=primary
+      - HEALTH_PORT=9999
+      - HEALTH_TIMEOUT=2
+      - DRYRUN_STATEFILE=/shared/zone.json
+    volumes:
+      - shared-state:/shared
+    depends_on:
+      - primary
+
+  # OTEL Watcher (watches DNS state, controls DR OTEL)
+  otel-watcher:
+    build:
+      context: .
+      dockerfile: Dockerfile.otel-watcher
+    container_name: otel-watcher
+    environment:
+      - DNS_RECORD=syslog.example.local
+      - MY_IP=10.20.20.20
+      - OTEL_CHECK_INTERVAL=5
+      - DRYRUN_STATEFILE=/shared/zone.json
+    volumes:
+      - shared-state:/shared
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - dr
+
+  # Simulated DR OTEL (controlled by watcher in real setup)
+  # In this test, watcher just logs state changes
+  dr-otel:
+    image: alpine
+    container_name: otel-dr
+    command: >
+      sh -c "
+        echo '[DR OTEL] Starting in STANDBY mode...' &&
+        echo '[DR OTEL] Waiting for otel-watcher to activate me...' &&
+        while true; do sleep 3600; done
+      "
+
+volumes:
+  shared-state:

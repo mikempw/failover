@@ -1,0 +1,262 @@
+---
+# OTEL Watcher for K3s/Kubernetes
+# 
+# Watches DNS failover record and scales OTEL collector deployment
+# Deploy this ONLY on the DR site
+#
+# kubectl apply -f otel-watcher.yaml
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dns-failover
+  labels:
+    app: dns-failover
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-watcher
+  namespace: dns-failover
+
+---
+# RBAC: Allow otel-watcher to scale deployments in the monitoring namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: otel-scaler
+  namespace: monitoring  # Change to your OTEL collector namespace
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments", "deployments/scale"]
+  verbs: ["get", "patch", "update"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: otel-watcher-scaler
+  namespace: monitoring  # Change to your OTEL collector namespace
+subjects:
+- kind: ServiceAccount
+  name: otel-watcher
+  namespace: dns-failover
+roleRef:
+  kind: Role
+  name: otel-scaler
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-watcher-config
+  namespace: dns-failover
+data:
+  # DNS record to watch (same as dns_failover uses)
+  DNS_RECORD: "syslog.example.com"
+  
+  # This site's IP (DR site IP)
+  MY_IP: "10.20.20.20"
+  
+  # Optional: DNS server to query (leave empty for system resolver)
+  DNS_SERVER: ""
+  
+  # How often to check DNS (seconds)
+  OTEL_CHECK_INTERVAL: "15"
+  
+  # Kubernetes settings - adjust these for your setup
+  OTEL_NAMESPACE: "monitoring"
+  OTEL_DEPLOYMENT: "otel-collector"
+  OTEL_REPLICAS_ACTIVE: "1"
+  OTEL_REPLICAS_INACTIVE: "0"
+  
+  # Method: kubectl or client
+  K8S_METHOD: "kubectl"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-watcher-script
+  namespace: dns-failover
+data:
+  otel_watcher_k8s.py: |
+    #!/usr/bin/env python3
+    """
+    OTEL Collector Watcher for Kubernetes/K3s
+    
+    Monitors the DNS failover record and scales the OTEL collector deployment
+    based on whether this site (DR) owns the DNS record.
+    """
+    
+    import os
+    import sys
+    import socket
+    import subprocess
+    import signal
+    import time
+    from datetime import datetime
+    
+    # Configuration
+    DNS_RECORD = os.getenv('DNS_RECORD', 'syslog.ast.example.local')
+    MY_IP = os.getenv('DR_IP', os.getenv('MY_IP'))
+    CHECK_INTERVAL = int(os.getenv('OTEL_CHECK_INTERVAL', '15'))
+    OTEL_NAMESPACE = os.getenv('OTEL_NAMESPACE', 'monitoring')
+    OTEL_DEPLOYMENT = os.getenv('OTEL_DEPLOYMENT', 'otel-collector')
+    OTEL_REPLICAS_ACTIVE = int(os.getenv('OTEL_REPLICAS_ACTIVE', '1'))
+    OTEL_REPLICAS_INACTIVE = int(os.getenv('OTEL_REPLICAS_INACTIVE', '0'))
+    DNS_SERVER = os.getenv('DNS_SERVER', '')
+    K8S_METHOD = os.getenv('K8S_METHOD', 'kubectl')
+    
+    def log(msg: str, level: str = "INFO"):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}] [{level}] [otel-watcher] {msg}", flush=True)
+    
+    def get_dns_ip() -> str:
+        try:
+            if DNS_SERVER:
+                result = subprocess.run(
+                    ['dig', f'@{DNS_SERVER}', DNS_RECORD, 'A', '+short'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return result.stdout.strip().split('\n')[0]
+            else:
+                return socket.gethostbyname(DNS_RECORD)
+        except Exception as e:
+            log(f"DNS lookup failed: {e}", "WARN")
+        return None
+    
+    def scale_deployment(replicas: int) -> bool:
+        try:
+            cmd = [
+                'kubectl', 'scale', 'deployment', OTEL_DEPLOYMENT,
+                f'--replicas={replicas}',
+                '-n', OTEL_NAMESPACE
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                log(f"Scaled {OTEL_DEPLOYMENT} to {replicas} replicas")
+                return True
+            else:
+                log(f"kubectl scale failed: {result.stderr}", "ERROR")
+                return False
+        except Exception as e:
+            log(f"kubectl error: {e}", "ERROR")
+            return False
+    
+    def get_current_replicas() -> int:
+        try:
+            cmd = [
+                'kubectl', 'get', 'deployment', OTEL_DEPLOYMENT,
+                '-n', OTEL_NAMESPACE,
+                '-o', 'jsonpath={.spec.replicas}'
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0 and result.stdout.strip():
+                return int(result.stdout.strip())
+        except:
+            pass
+        return -1
+    
+    def main():
+        log("="*60)
+        log("OTEL Collector Watcher for K3s/Kubernetes")
+        log("="*60)
+        
+        if not MY_IP:
+            log("ERROR: MY_IP or DR_IP must be set", "ERROR")
+            sys.exit(1)
+        
+        log(f"DNS Record:       {DNS_RECORD}")
+        log(f"My IP (DR):       {MY_IP}")
+        log(f"Check Interval:   {CHECK_INTERVAL}s")
+        log(f"K8s Namespace:    {OTEL_NAMESPACE}")
+        log(f"K8s Deployment:   {OTEL_DEPLOYMENT}")
+        log("="*60)
+        
+        current = get_current_replicas()
+        if current >= 0:
+            log(f"Current {OTEL_DEPLOYMENT} replicas: {current}")
+        
+        def shutdown(signum, frame):
+            log("Shutdown signal received")
+            sys.exit(0)
+        
+        signal.signal(signal.SIGTERM, shutdown)
+        signal.signal(signal.SIGINT, shutdown)
+        
+        last_state = None
+        
+        while True:
+            try:
+                current_ip = get_dns_ip()
+                
+                if current_ip is None:
+                    log("Could not resolve DNS - keeping current state", "WARN")
+                    time.sleep(CHECK_INTERVAL)
+                    continue
+                
+                should_be_active = (current_ip == MY_IP)
+                
+                if should_be_active != last_state:
+                    if should_be_active:
+                        log(f"DNS points to us ({current_ip}) - ACTIVATING OTEL", "INFO")
+                        scale_deployment(OTEL_REPLICAS_ACTIVE)
+                    else:
+                        log(f"DNS points elsewhere ({current_ip}) - DEACTIVATING OTEL", "INFO")
+                        scale_deployment(OTEL_REPLICAS_INACTIVE)
+                    last_state = should_be_active
+                
+            except Exception as e:
+                log(f"Error in main loop: {e}", "ERROR")
+            
+            time.sleep(CHECK_INTERVAL)
+    
+    if __name__ == '__main__':
+        main()
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-watcher
+  namespace: dns-failover
+  labels:
+    app: otel-watcher
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-watcher
+  template:
+    metadata:
+      labels:
+        app: otel-watcher
+    spec:
+      serviceAccountName: otel-watcher
+      containers:
+      - name: otel-watcher
+        image: bitnami/kubectl:latest  # Has kubectl + python
+        command: ["python3", "/scripts/otel_watcher_k8s.py"]
+        envFrom:
+        - configMapRef:
+            name: otel-watcher-config
+        volumeMounts:
+        - name: script
+          mountPath: /scripts
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+      volumes:
+      - name: script
+        configMap:
+          name: otel-watcher-script
+          defaultMode: 0755
+      restartPolicy: Always

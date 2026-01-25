@@ -1,0 +1,90 @@
+# Docker Compose for DR Site (Production)
+#
+# This runs on your DR site and includes:
+#   - dns-failover (monitors primary, takes over DNS if needed)
+#   - otel-watcher (watches DNS, starts/stops OTEL collector)
+#   - otel-collector (YOUR config - started/stopped by watcher)
+#
+# Prerequisites:
+#   1. Run setup.py to generate .env.dr with your DNS provider credentials
+#   2. Update otel-config.yaml with your OTEL collector config
+#   3. Update MY_IP to your DR site's IP address
+#
+# Usage:
+#   docker-compose -f docker-compose.dr.yaml up -d
+#
+# The OTEL collector starts STOPPED. The watcher will start it
+# only when DNS failover points to this site.
+
+version: '3.8'
+
+services:
+  # DNS Failover Monitor (always running)
+  dns-failover:
+    build: .
+    container_name: dns-failover
+    restart: unless-stopped
+    env_file: .env.dr
+    # Optionally mount state for debugging
+    # volumes:
+    #   - ./state:/state
+
+  # OTEL Watcher (always running, controls otel-collector)
+  otel-watcher:
+    build:
+      context: .
+      dockerfile: Dockerfile.otel-watcher-docker
+    container_name: otel-watcher
+    restart: unless-stopped
+    environment:
+      # DNS record to watch (same as in .env.dr)
+      - DNS_RECORD=${DNS_RECORD:-syslog.example.com}
+      
+      # THIS site's IP - when DNS points here, start OTEL
+      - MY_IP=${DR_IP:-10.20.20.20}
+      
+      # How often to check DNS
+      - OTEL_CHECK_INTERVAL=15
+      
+      # Container name to control
+      - OTEL_CONTAINER=otel-collector
+      
+      # Optional: specific DNS server
+      - DNS_SERVER=${DNS_SERVER:-}
+    volumes:
+      # Mount Docker socket to control containers
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - dns-failover
+      - otel-collector
+
+  # OTEL Collector (controlled by watcher)
+  # NOTE: This container is CREATED but not started automatically
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    # DO NOT use restart: always - watcher controls this
+    restart: "no"
+    volumes:
+      - ./otel-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8888:8888"   # Prometheus metrics
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    # Start stopped - watcher will start when DR becomes active
+    # To achieve this, we use a profile that's not in default
+    profiles:
+      - manual  # This prevents auto-start
+
+# After docker-compose up, create the collector container manually (stopped):
+#
+#   docker-compose -f docker-compose.dr.yaml up -d dns-failover otel-watcher
+#   docker-compose -f docker-compose.dr.yaml create otel-collector
+#
+# Or simpler - just run all then stop collector:
+#
+#   docker-compose -f docker-compose.dr.yaml up -d
+#   docker stop otel-collector
+#
+# The watcher will start it when failover happens.
