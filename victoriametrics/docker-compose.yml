@@ -123,8 +123,7 @@ services:
     volumes:
       - vm-sync-state:/state
     depends_on:
-      victoriametrics:
-        condition: service_healthy
+      - victoriametrics
     logging:
       driver: "json-file"
       options:
