@@ -1,0 +1,62 @@
+version: '3.8'
+
+# VictoriaMetrics + VM-Sync Stack
+# Deploy this at both primary and DR sites with appropriate .env file
+
+services:
+  # VictoriaMetrics Single Instance
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.96.0
+    container_name: victoriametrics
+    restart: unless-stopped
+    ports:
+      - "8428:8428"   # HTTP API (query + write)
+      - "8089:8089"   # Influx line protocol (optional)
+      - "4242:4242"   # OpenTSDB (optional)
+    volumes:
+      - vm-data:/storage
+    command:
+      - "--storageDataPath=/storage"
+      - "--httpListenAddr=:8428"
+      - "--retentionPeriod=90d"
+      - "--dedup.minScrapeInterval=30s"   # Dedup samples within 30s window
+      - "--search.maxUniqueTimeseries=1000000"
+      - "--search.maxSamplesPerQuery=100000000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8428/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - monitoring
+
+  # VM-Sync Daemon - Ensures data parity between sites
+  vm-sync:
+    build:
+      context: .
+      dockerfile: Dockerfile.vm-sync
+    image: vm-sync:latest
+    container_name: vm-sync
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Override or add vars here
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - vm-sync-state:/state
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+    networks:
+      - monitoring
+
+volumes:
+  vm-data:
+    driver: local
+  vm-sync-state:
+    driver: local
+
+networks:
+  monitoring:
+    driver: bridge
