@@ -1,0 +1,155 @@
+version: '3.8'
+
+# =============================================================================
+# VictoriaMetrics + VM-Sync Stack
+# =============================================================================
+# Deploy this at both primary and DR sites with appropriate .env file
+#
+# Primary site: cp .env.primary .env && docker compose up -d
+# DR site:      cp .env.dr .env && docker compose up -d
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # VictoriaMetrics Single Instance
+  # ---------------------------------------------------------------------------
+  # Docs: https://docs.victoriametrics.com/single-server-victoriametrics/
+  # ---------------------------------------------------------------------------
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.99.0
+    container_name: victoriametrics
+    restart: unless-stopped
+    ports:
+      - "8428:8428"     # HTTP API (query, write, UI)
+      - "8089:8089"     # Influx line protocol
+      - "2003:2003"     # Graphite
+      - "4242:4242"     # OpenTSDB
+    volumes:
+      - vm-data:/storage
+    command:
+      # -----------------------------
+      # Storage
+      # -----------------------------
+      - "--storageDataPath=/storage"
+      - "--retentionPeriod=90d"
+      
+      # -----------------------------
+      # Deduplication (IMPORTANT for dual-write)
+      # -----------------------------
+      # When both OTEL collectors write the same data, or during sync,
+      # VM will dedupe samples within this window
+      - "--dedup.minScrapeInterval=60s"
+      
+      # -----------------------------
+      # Memory Management
+      # -----------------------------
+      # Limit memory for search/insert operations
+      # Adjust based on your available RAM
+      - "--memory.allowedPercent=60"
+      
+      # -----------------------------
+      # Query Limits
+      # -----------------------------
+      - "--search.maxUniqueTimeseries=1000000"
+      - "--search.maxSamplesPerQuery=500000000"
+      - "--search.maxPointsPerTimeseries=86400"
+      - "--search.maxQueryDuration=120s"
+      
+      # -----------------------------
+      # Insert Limits
+      # -----------------------------
+      - "--maxLabelsPerTimeseries=50"
+      - "--maxLabelValueLen=4096"
+      
+      # -----------------------------
+      # HTTP Server
+      # -----------------------------
+      - "--httpListenAddr=:8428"
+      - "--http.pathPrefix=/"
+      
+      # -----------------------------
+      # Logging
+      # -----------------------------
+      - "--loggerTimezone=UTC"
+      - "--loggerFormat=default"
+      
+      # -----------------------------
+      # Prometheus Remote Write
+      # -----------------------------
+      # Accept remote write from OTEL/Prometheus
+      - "--remoteWrite.maxInsertRequestSize=64MB"
+      
+      # -----------------------------
+      # Performance Tuning
+      # -----------------------------
+      # Merge speed for background compaction
+      - "--smallMergeConcurrency=2"
+      - "--bigMergeConcurrency=1"
+      
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8428/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    networks:
+      - monitoring
+
+  # ---------------------------------------------------------------------------
+  # VM-Sync Daemon
+  # ---------------------------------------------------------------------------
+  # Ensures data parity between primary and DR VictoriaMetrics instances
+  # ---------------------------------------------------------------------------
+  vm-sync:
+    build:
+      context: .
+      dockerfile: Dockerfile.vm-sync
+    image: vm-sync:latest
+    container_name: vm-sync
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - vm-sync-state:/state
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+    networks:
+      - monitoring
+
+volumes:
+  # VictoriaMetrics data - IMPORTANT: back this up!
+  vm-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${VM_DATA_PATH:-/opt/vm-sync/data/victoriametrics}
+
+  # VM-Sync state (small, but persists across restarts)
+  vm-sync-state:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${VM_SYNC_STATE_PATH:-/opt/vm-sync/data/vm-sync}
+
+networks:
+  monitoring:
+    driver: bridge
