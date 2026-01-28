@@ -1078,6 +1078,19 @@ def heartbeat_primary(cfg: Config, provider: DNSProvider):
                 time.sleep(cfg.update_interval)
                 continue
         
+        # Check current lease owner before renewing
+        try:
+            records = provider.get_records()
+            txt_data = parse_txt(records.get('TXT'))
+            current_owner = txt_data.get('owner')
+            
+            if current_owner == 'dr':
+                log("DR currently owns lease - not overwriting (run 'failback' to reclaim)", "WARN")
+                time.sleep(cfg.update_interval)
+                continue
+        except Exception as e:
+            log(f"Failed to check lease owner: {e} - attempting renewal anyway", "WARN")
+        
         # Renew lease
         try:
             exp = now_unix() + cfg.lease_ttl
