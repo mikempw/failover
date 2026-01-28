@@ -1052,7 +1052,33 @@ def show_dns(cfg: Config, provider: DNSProvider):
 def heartbeat_primary(cfg: Config, provider: DNSProvider):
     log(f"Starting PRIMARY heartbeat for {cfg.dns_record}")
     log(f"  Update interval: {cfg.update_interval}s, Lease TTL: {cfg.lease_ttl}s")
+    
+    # Initialize self-health checker if configured
+    self_health_checker = None
+    if cfg.health_url:
+        log(f"  Self-health check enabled:")
+        log(f"    URL: {cfg.health_url}")
+        log(f"    Metric: {cfg.health_metric}")
+        log(f"    Stale threshold: {cfg.health_stale_count}")
+        self_health_checker = MetricsHealthChecker(
+            cfg.health_url,
+            cfg.health_metric,
+            cfg.health_stale_count,
+            cfg.health_timeout
+        )
+    else:
+        log(f"  Self-health check: disabled (no HEALTH_URL)")
+    
     while True:
+        # Check own OTEL health before renewing
+        if self_health_checker:
+            local_healthy = self_health_checker.check()
+            if not local_healthy:
+                log("Local OTEL unhealthy - NOT renewing lease (will expire)", "WARN")
+                time.sleep(cfg.update_interval)
+                continue
+        
+        # Renew lease
         try:
             exp = now_unix() + cfg.lease_ttl
             provider.set_records(cfg.primary_ip, 'primary', exp)
