@@ -146,6 +146,10 @@ class Config:
     health_host: str
     health_port: int
     health_timeout: int
+    health_mode: str  # 'tcp' or 'metrics'
+    health_url: Optional[str]  # For metrics mode: http://host:8888/metrics
+    health_metric: Optional[str]  # Metric name to check, e.g., otelcol_receiver_accepted_metric_points
+    health_stale_count: int  # Number of flat readings before unhealthy
     role: str
     
     # Provider-specific
@@ -222,6 +226,10 @@ class Config:
             health_host=get('HEALTH_HOST', '10.10.10.10'),
             health_port=get_int('HEALTH_PORT', 6514),
             health_timeout=get_int('HEALTH_TIMEOUT', 2),
+            health_mode=get('HEALTH_MODE', 'tcp'),
+            health_url=get('HEALTH_URL'),
+            health_metric=get('HEALTH_METRIC', 'otelcol_receiver_accepted_metric_points'),
+            health_stale_count=get_int('HEALTH_STALE_COUNT', 3),
             role=get('ROLE', 'primary'),
             dryrun_statefile=get('DRYRUN_STATEFILE', '/state/zone.json'),
             tsig_keyfile=get('TSIG_KEYFILE', '/secrets/tsig.key'),
@@ -324,6 +332,16 @@ class Config:
             elif not os.access(self.script_get, os.X_OK):
                 errors.append(f"SCRIPT_GET not executable: {self.script_get}")
         
+        # Health check validation
+        if self.health_mode not in ['tcp', 'metrics']:
+            errors.append(f"Invalid HEALTH_MODE: {self.health_mode}. Valid: tcp, metrics")
+        
+        if self.health_mode == 'metrics' and self.role == 'dr':
+            if not self.health_url:
+                errors.append("HEALTH_URL required when HEALTH_MODE=metrics")
+            if not self.health_metric:
+                errors.append("HEALTH_METRIC required when HEALTH_MODE=metrics")
+        
         if self.lease_ttl <= self.update_interval:
             errors.append(f"LEASE_TTL ({self.lease_ttl}) must be > UPDATE_INTERVAL ({self.update_interval})")
         
@@ -360,6 +378,125 @@ def check_tcp(host: str, port: int, timeout: int) -> bool:
             return True
     except Exception:
         return False
+
+# -----------------------------
+# Metrics-based Health Check
+# -----------------------------
+
+def fetch_metrics(url: str, timeout: int) -> Optional[str]:
+    """Fetch Prometheus metrics from URL."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={'User-Agent': 'dns-failover'})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode('utf-8')
+    except Exception as e:
+        log(f"Failed to fetch metrics from {url}: {e}", "WARN")
+        return None
+
+def parse_metric_value(metrics_text: str, metric_name: str) -> Optional[float]:
+    """
+    Parse a Prometheus metric value from text format.
+    Handles metrics with labels, summing all label combinations.
+    
+    Example input:
+        otelcol_receiver_accepted_metric_points{receiver="prometheus"} 12345
+        otelcol_receiver_accepted_metric_points{receiver="otlp"} 6789
+    
+    Returns: sum of all matching metric values (12345 + 6789 = 19134)
+    """
+    if not metrics_text:
+        return None
+    
+    total = 0.0
+    found = False
+    
+    for line in metrics_text.split('\n'):
+        line = line.strip()
+        # Skip comments and empty lines
+        if not line or line.startswith('#'):
+            continue
+        
+        # Check if line starts with metric name
+        if line.startswith(metric_name):
+            try:
+                # Handle metrics with labels: metric_name{label="value"} 123
+                # Or without labels: metric_name 123
+                if '{' in line:
+                    # metric_name{labels} value
+                    value_part = line.split('}')[-1].strip()
+                else:
+                    # metric_name value
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        value_part = parts[1]
+                    else:
+                        continue
+                
+                total += float(value_part)
+                found = True
+            except (ValueError, IndexError):
+                continue
+    
+    return total if found else None
+
+
+class MetricsHealthChecker:
+    """
+    Health checker that monitors if OTEL metrics are incrementing.
+    
+    Healthy = metric value is increasing
+    Unhealthy = metric value flat/decreasing for N consecutive checks
+    """
+    
+    def __init__(self, url: str, metric_name: str, stale_count: int, timeout: int):
+        self.url = url
+        self.metric_name = metric_name
+        self.stale_count = stale_count
+        self.timeout = timeout
+        self.last_value: Optional[float] = None
+        self.stale_checks = 0
+    
+    def check(self) -> bool:
+        """
+        Check if metrics are healthy (incrementing).
+        
+        Returns:
+            True if healthy (metrics incrementing)
+            False if unhealthy (can't fetch, or flat for stale_count checks)
+        """
+        metrics_text = fetch_metrics(self.url, self.timeout)
+        if metrics_text is None:
+            # Can't reach endpoint
+            self.stale_checks += 1
+            log(f"Metrics endpoint unreachable ({self.stale_checks}/{self.stale_count})", "WARN")
+            return self.stale_checks < self.stale_count
+        
+        current_value = parse_metric_value(metrics_text, self.metric_name)
+        if current_value is None:
+            log(f"Metric '{self.metric_name}' not found in response", "WARN")
+            self.stale_checks += 1
+            return self.stale_checks < self.stale_count
+        
+        # First check - just record the value
+        if self.last_value is None:
+            self.last_value = current_value
+            log(f"Metrics baseline: {self.metric_name}={current_value}")
+            return True
+        
+        # Compare with last value
+        if current_value > self.last_value:
+            # Value increasing - healthy
+            log(f"Metrics healthy: {self.metric_name}={current_value} (+{current_value - self.last_value:.0f})")
+            self.last_value = current_value
+            self.stale_checks = 0
+            return True
+        else:
+            # Value flat or decreasing
+            self.stale_checks += 1
+            log(f"Metrics stale: {self.metric_name}={current_value} (unchanged, {self.stale_checks}/{self.stale_count})", "WARN")
+            self.last_value = current_value
+            return self.stale_checks < self.stale_count
 
 # -----------------------------
 # DNS Providers
@@ -926,17 +1063,48 @@ def heartbeat_primary(cfg: Config, provider: DNSProvider):
 
 def heartbeat_dr(cfg: Config, provider: DNSProvider):
     log(f"Starting DR heartbeat for {cfg.dns_record}")
-    log(f"  Monitoring: {cfg.health_host}:{cfg.health_port}")
+    
+    # Initialize health checker based on mode
+    if cfg.health_mode == 'metrics':
+        if not cfg.health_url:
+            log("HEALTH_MODE=metrics but HEALTH_URL not set, falling back to tcp", "WARN")
+            cfg.health_mode = 'tcp'
+        else:
+            log(f"  Health mode: metrics")
+            log(f"  Metrics URL: {cfg.health_url}")
+            log(f"  Metric: {cfg.health_metric}")
+            log(f"  Stale threshold: {cfg.health_stale_count}")
+            metrics_checker = MetricsHealthChecker(
+                cfg.health_url,
+                cfg.health_metric,
+                cfg.health_stale_count,
+                cfg.health_timeout
+            )
+    
+    if cfg.health_mode == 'tcp':
+        log(f"  Health mode: tcp")
+        log(f"  Monitoring: {cfg.health_host}:{cfg.health_port}")
+    
     log(f"  Fail threshold: {cfg.fail_threshold}, Check interval: {cfg.update_interval}s")
+    
     consecutive_failures = 0
     while True:
-        primary_healthy = check_tcp(cfg.health_host, cfg.health_port, cfg.health_timeout)
+        # Perform health check based on mode
+        if cfg.health_mode == 'metrics':
+            primary_healthy = metrics_checker.check()
+        else:
+            primary_healthy = check_tcp(cfg.health_host, cfg.health_port, cfg.health_timeout)
+            if primary_healthy:
+                log("Primary healthy")
+        
         if primary_healthy:
             consecutive_failures = 0
-            log("Primary healthy")
         else:
             consecutive_failures += 1
-            log(f"Primary health check failed ({consecutive_failures}/{cfg.fail_threshold})", "WARN")
+            if cfg.health_mode == 'tcp':
+                log(f"Primary health check failed ({consecutive_failures}/{cfg.fail_threshold})", "WARN")
+            # metrics mode logs its own messages
+            
             if consecutive_failures >= cfg.fail_threshold:
                 records = provider.get_records()
                 txt_data = parse_txt(records.get('TXT'))
