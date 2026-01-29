@@ -484,17 +484,29 @@ def sync_partition(cfg: Config, database: str, table: str, partition: str,
                    source_user: str, source_password: str) -> Tuple[bool, int]:
     """
     Sync a single partition from source to local.
-    Uses INSERT...SELECT...remote() pattern.
+    Uses DROP + INSERT pattern to ensure exact match (no duplicates).
     
     Returns: (success, rows_synced)
     """
-    # Build the remote() query
-    # Note: We need to handle the case where partition might already have some data
-    # Strategy: Get max timestamp from local, sync only newer data
+    log(f"Syncing partition {partition} for {database}.{table}", "DEBUG")
     
-    # First, get local max timestamp for this partition (if table has timestamp column)
-    # For simplicity, we'll do a full partition sync with ON CLUSTER dedup handling
+    # Step 1: DROP existing partition to avoid duplicates
+    drop_query = f"ALTER TABLE {database}.{table} DROP PARTITION '{partition}'"
     
+    log(f"  Dropping partition {partition}...", "DEBUG")
+    drop_success = ch_execute(
+        cfg.local_ch_url,
+        drop_query,
+        cfg.local_ch_user,
+        cfg.local_ch_password,
+        timeout=60
+    )
+    
+    if not drop_success:
+        # Partition might not exist locally, which is fine - continue with insert
+        log(f"  Partition {partition} drop returned error (may not exist, continuing)", "DEBUG")
+    
+    # Step 2: INSERT from remote
     sync_query = f"""
     INSERT INTO {database}.{table}
     SELECT * FROM remote(
@@ -506,12 +518,10 @@ def sync_partition(cfg: Config, database: str, table: str, partition: str,
     WHERE _partition_id = '{partition}'
     SETTINGS
         connect_timeout_with_failover_ms = {cfg.connect_timeout_ms},
-        max_insert_threads = {cfg.max_insert_threads},
-        insert_deduplicate = 1
+        max_insert_threads = {cfg.max_insert_threads}
     """
     
-    log(f"Syncing partition {partition} for {database}.{table}", "DEBUG")
-    
+    log(f"  Copying partition {partition} from remote...", "DEBUG")
     success = ch_execute(
         cfg.local_ch_url, 
         sync_query, 
