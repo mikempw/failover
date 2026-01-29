@@ -86,6 +86,7 @@ docker compose logs -f ch-sync
 | `PRIMARY_IP` | Primary site IP |
 | `DR_IP` | DR site IP |
 | `CHECK_INTERVAL` | Seconds between checks (default 60) |
+| `AUTO_CREATE_TABLES` | Auto-create missing tables (default false) |
 
 ## Testing DNS Without Real DNS
 
@@ -108,6 +109,26 @@ docker compose logs -f ch-sync
 # [INFO] Found 1 local tables, 1 remote tables
 # [INFO] All tables in sync (clean check #1)
 ```
+
+## Auto-Create Tables
+
+When `AUTO_CREATE_TABLES=true`, ch-sync will automatically create tables that exist on the active site but not on the passive site.
+
+```bash
+# With auto-create enabled, you'll see:
+# [INFO] Auto-creating table: default.new_telemetry
+# [INFO] Successfully created table: default.new_telemetry
+# [INFO] Auto-created 1 tables: default.new_telemetry
+```
+
+This copies the exact DDL from the active site, including:
+- Engine type and settings
+- Partition key
+- Order by / Primary key
+- TTL settings
+- Any other table options
+
+**Note**: The database will also be created if it doesn't exist.
 
 ## Test Sync
 
