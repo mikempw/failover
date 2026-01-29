@@ -1,0 +1,45 @@
+# =============================================================================
+# ClickHouse Sync (ch-sync) Stack
+# =============================================================================
+# Ensures data parity between primary and DR ClickHouse instances
+#
+# Primary site: cp .env.primary .env && docker compose up -d
+# DR site:      cp .env.dr .env && docker compose up -d
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # CH-Sync Daemon
+  # ---------------------------------------------------------------------------
+  # Discovers tables, compares partitions, syncs missing data
+  # ---------------------------------------------------------------------------
+  ch-sync:
+    build:
+      context: .
+      dockerfile: Dockerfile.ch-sync
+    image: ch-sync:latest
+    container_name: ch-sync
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ch-sync-state:/state
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+    networks:
+      - monitoring
+
+volumes:
+  ch-sync-state:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${CH_SYNC_STATE_PATH:-/opt/ch-sync/data}
+
+networks:
+  monitoring:
+    driver: bridge
