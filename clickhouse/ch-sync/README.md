@@ -28,9 +28,18 @@ Automated data synchronization between primary and DR ClickHouse instances.
 
 1. **DNS Check**: Reads DNS record to determine active site
 2. **Table Discovery**: Scans both ClickHouse instances for MergeTree tables
-3. **Partition Comparison**: Compares row counts per partition via `system.parts`
-4. **Gap Sync**: Uses `INSERT...SELECT...remote()` to copy missing partitions
-5. **Failback Signal**: After 3 clean checks, emits "FAILBACK READY"
+3. **Auto-Create Tables**: Creates missing tables on passive site (if enabled)
+4. **Partition Comparison**: Compares row counts per partition via `system.parts`
+5. **Gap Sync**: Uses DROP + INSERT to copy missing/mismatched partitions
+6. **Failback Signal**: After 3 clean checks, emits "FAILBACK READY"
+
+### Sync Method: DROP + Re-copy
+
+When a partition mismatch is detected, ch-sync:
+1. **DROPs** the partition locally (avoids duplicates)
+2. **INSERTs** from remote using `remote()` function
+
+This ensures exact data parity - no duplicate rows, no partial syncs.
 
 ## Prerequisites
 
