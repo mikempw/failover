@@ -1,0 +1,30 @@
+<clickhouse>
+    <remote_servers>
+        <!-- 
+          Cluster: cluster_replicated
+          - Single shard with 2 replicas = FULL REPLICATION
+          - internal_replication=false = writes go to BOTH nodes
+          - All data exists on both hosts
+        -->
+        <cluster_replicated>
+            <shard>
+                <!-- false = Distributed table writes to ALL replicas -->
+                <internal_replication>false</internal_replication>
+                
+                <!-- Primary site - UPDATE THIS IP -->
+                <replica>
+                    <host>192.168.100.144</host>
+                    <port>9000</port>
+                    <priority>1</priority>
+                </replica>
+                
+                <!-- DR site - UPDATE THIS IP -->
+                <replica>
+                    <host>192.168.100.143</host>
+                    <port>9000</port>
+                    <priority>2</priority>
+                </replica>
+            </shard>
+        </cluster_replicated>
+    </remote_servers>
+</clickhouse>
