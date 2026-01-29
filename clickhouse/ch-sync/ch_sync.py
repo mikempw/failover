@@ -73,6 +73,7 @@ class Config:
     notify_on_sync: bool
     notify_on_failback_ready: bool
     notify_on_new_table: bool
+    auto_create_tables: bool
 
     @classmethod
     def from_env(cls):
@@ -117,6 +118,7 @@ class Config:
             notify_on_sync=get_bool('NOTIFY_ON_SYNC', True),
             notify_on_failback_ready=get_bool('NOTIFY_ON_FAILBACK_READY', True),
             notify_on_new_table=get_bool('NOTIFY_ON_NEW_TABLE', True),
+            auto_create_tables=get_bool('AUTO_CREATE_TABLES', False),
         )
 
     def validate(self):
@@ -143,6 +145,7 @@ class SyncState:
     tables_with_gaps: int = 0
     partitions_synced: int = 0
     rows_synced: int = 0
+    tables_created: List[str] = field(default_factory=list)
     new_tables_detected: List[str] = field(default_factory=list)
     last_error: Optional[str] = None
 
@@ -157,6 +160,7 @@ class SyncState:
             'tables_with_gaps': self.tables_with_gaps,
             'partitions_synced': self.partitions_synced,
             'rows_synced': self.rows_synced,
+            'tables_created': self.tables_created,
             'new_tables_detected': self.new_tables_detected,
             'last_error': self.last_error,
         }
@@ -173,6 +177,7 @@ class SyncState:
             tables_with_gaps=data.get('tables_with_gaps', 0),
             partitions_synced=data.get('partitions_synced', 0),
             rows_synced=data.get('rows_synced', 0),
+            tables_created=data.get('tables_created', []),
             new_tables_detected=data.get('new_tables_detected', []),
             last_error=data.get('last_error'),
         )
@@ -385,6 +390,71 @@ def get_partition_counts(ch_url: str, user: str, password: str,
     return {row['partition']: int(row['row_count']) for row in rows}
 
 
+def get_create_table_ddl(ch_url: str, user: str, password: str,
+                         database: str, table: str) -> Optional[str]:
+    """
+    Get CREATE TABLE statement from ClickHouse.
+    Returns the DDL string or None if failed.
+    """
+    query = f"SHOW CREATE TABLE {database}.{table}"
+    
+    try:
+        url = f"{ch_url}/"
+        data = query.encode('utf-8')
+        req = urllib.request.Request(url, data=data, method='POST')
+        req.add_header('Content-Type', 'text/plain')
+        
+        if user and password:
+            import base64
+            credentials = base64.b64encode(f"{user}:{password}".encode()).decode()
+            req.add_header('Authorization', f'Basic {credentials}')
+        elif user:
+            req.add_header('X-ClickHouse-User', user)
+        
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            ddl = resp.read().decode().strip()
+            return ddl
+    
+    except Exception as e:
+        log(f"Failed to get CREATE TABLE for {database}.{table}: {e}", "ERROR")
+        return None
+
+
+def create_table_from_remote(cfg: Config, database: str, table: str) -> bool:
+    """
+    Create a table locally by copying DDL from remote (active) site.
+    Returns True if successful.
+    """
+    full_name = f"{database}.{table}"
+    log(f"Auto-creating table: {full_name}")
+    
+    # Get DDL from remote
+    ddl = get_create_table_ddl(
+        cfg.remote_ch_url, cfg.remote_ch_user, cfg.remote_ch_password,
+        database, table
+    )
+    
+    if not ddl:
+        log(f"Could not get DDL for {full_name}", "ERROR")
+        return False
+    
+    log(f"Got DDL for {full_name}", "DEBUG")
+    
+    # Ensure database exists locally
+    create_db_query = f"CREATE DATABASE IF NOT EXISTS {database}"
+    if not ch_execute(cfg.local_ch_url, create_db_query, cfg.local_ch_user, cfg.local_ch_password):
+        log(f"Failed to create database {database}", "ERROR")
+        return False
+    
+    # Execute the CREATE TABLE on local
+    if ch_execute(cfg.local_ch_url, ddl, cfg.local_ch_user, cfg.local_ch_password):
+        log(f"Successfully created table: {full_name}")
+        return True
+    else:
+        log(f"Failed to create table: {full_name}", "ERROR")
+        return False
+
+
 # -----------------------------
 # Sync Logic
 # -----------------------------
@@ -566,10 +636,25 @@ def run_sync_check(cfg: Config, state: SyncState) -> SyncState:
     log(f"Found {len(local_tables)} local tables, {len(remote_tables)} remote tables")
     
     # Check for new tables on remote that don't exist locally
+    tables_created = []
     for table_name in remote_tables:
         if table_name not in local_tables:
-            log(f"NEW TABLE on active site: {table_name} (needs manual creation)", "WARN")
-            state.new_tables_detected.append(table_name)
+            if cfg.auto_create_tables:
+                # Auto-create the table
+                remote_info = remote_tables[table_name]
+                if create_table_from_remote(cfg, remote_info['database'], remote_info['table']):
+                    tables_created.append(table_name)
+                    # Add to local_tables so it gets synced this cycle
+                    local_tables[table_name] = remote_info
+                else:
+                    log(f"NEW TABLE on active site: {table_name} (auto-create FAILED)", "WARN")
+                    state.new_tables_detected.append(table_name)
+            else:
+                log(f"NEW TABLE on active site: {table_name} (needs manual creation)", "WARN")
+                state.new_tables_detected.append(table_name)
+    
+    if tables_created:
+        log(f"Auto-created {len(tables_created)} tables: {', '.join(tables_created)}")
     
     if state.new_tables_detected and cfg.notify_on_new_table:
         notify(cfg, "new_tables", state)
