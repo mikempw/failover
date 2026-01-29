@@ -1,0 +1,25 @@
+<clickhouse>
+    <users>
+        <default>
+            <!-- Allow connections from anywhere -->
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <access_management>1</access_management>
+        </default>
+    </users>
+    
+    <profiles>
+        <default>
+            <!-- Increased timeouts for WAN connections -->
+            <connect_timeout_with_failover_ms>5000</connect_timeout_with_failover_ms>
+            <connect_timeout_with_failover_secure_ms>5000</connect_timeout_with_failover_secure_ms>
+            <receive_timeout>300</receive_timeout>
+            <send_timeout>300</send_timeout>
+            <max_memory_usage>10000000000</max_memory_usage>
+            <max_execution_time>600</max_execution_time>
+        </default>
+    </profiles>
+</clickhouse>
