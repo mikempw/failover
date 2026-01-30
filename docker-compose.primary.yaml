@@ -1,0 +1,56 @@
+# Docker Compose for Primary Site
+#
+# This runs on your PRIMARY site and includes:
+#   - dns-failover (renews lease, self-health checks OTEL)
+#   - otel-watcher (watches DNS, starts/stops OTEL collector)
+#
+# Prerequisites:
+#   1. Create .env.primary with your DNS provider credentials
+#   2. Build images: docker-compose -f docker-compose.primary.yaml build
+#   3. Update MY_IP to your primary site's IP address
+#
+# Usage:
+#   docker-compose -f docker-compose.primary.yaml up -d
+
+version: '3.8'
+
+services:
+  # DNS Failover (always running)
+  dns-failover:
+    image: dns-failover
+    build: .
+    container_name: dns-failover
+    restart: unless-stopped
+    env_file:
+      - .env.primary
+    volumes:
+      - ./state:/state
+
+  # OTEL Watcher (always running, controls otel-collector)
+  otel-watcher:
+    image: otel-watcher
+    build:
+      context: .
+      dockerfile: Dockerfile.otel-watcher-docker
+    container_name: otel-watcher
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # DNS record to watch
+      - DNS_RECORD=failover.mpwlabs.com
+      
+      # THIS site's IP - when DNS points here, start OTEL
+      - MY_IP=192.168.100.144
+      
+      # How often to check DNS
+      - OTEL_CHECK_INTERVAL=15
+      
+      # Container name to control (your existing AST collector)
+      - OTEL_CONTAINER=application-study-tool-otel-collector-1
+      
+      # DNS server to query
+      - DNS_SERVER=8.8.8.8
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - dns-failover
