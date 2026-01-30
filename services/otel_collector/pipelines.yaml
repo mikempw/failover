@@ -1,0 +1,40 @@
+# pipelines.yaml
+#
+# OTEL pipelines for dual-site metrics delivery
+# Place in: services/otel_collector/pipelines.yaml
+
+metrics:
+  receivers:
+    - bigip
+  processors:
+    - batch/local
+  exporters:
+    - prometheusremotewrite/primary   # → Primary VictoriaMetrics
+    - prometheusremotewrite/dr        # → DR VictoriaMetrics
+    - clickhouse                      # → ClickHouse (synced via ch-sync)
+
+metrics/f5-datafabric:
+  receivers:
+    - bigip
+  processors:
+    - batch/f5-datafabric
+    - interval/f5-datafabric
+    - attributes/f5-datafabric
+  exporters:
+    - otlp/f5-datafabric
+
+logs:
+  receivers:
+    - bigip
+  processors:
+    - batch/local
+  exporters:
+    - clickhouse
+
+traces:
+  receivers:
+    - bigip
+  processors:
+    - batch/local
+  exporters:
+    - clickhouse

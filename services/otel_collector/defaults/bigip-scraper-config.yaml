@@ -1,0 +1,110 @@
+# bigip-scraper-config.yaml
+#
+# OTEL Collector config for dual-site metrics delivery
+# Pushes metrics to BOTH Primary and DR VictoriaMetrics instances
+# This ensures DR always has up-to-date metrics for instant failover
+#
+# Place in: services/otel_collector/defaults/bigip-scraper-config.yaml
+
+receivers: ${file:/etc/otel-collector-config/receivers.yaml}
+
+processors:
+  batch/local:
+    timeout: 10s
+    send_batch_size: 10000
+    
+  batch/f5-datafabric:
+    send_batch_max_size: 8192
+    
+  interval/f5-datafabric:
+    interval: 300s
+    
+  attributes/f5-datafabric:
+    actions:
+      - key: dataType
+        action: upsert
+        value: bigip-ast-metric
+
+exporters:
+  # ===================
+  # Primary VictoriaMetrics (local)
+  # ===================
+  prometheusremotewrite/primary:
+    endpoint: http://victoriametrics:8428/api/v1/write
+    tls:
+      insecure: true
+    resource_to_telemetry_conversion:
+      enabled: true
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+  # ===================
+  # DR VictoriaMetrics (remote)
+  # ===================
+  prometheusremotewrite/dr:
+    endpoint: http://192.168.100.143:8428/api/v1/write
+    tls:
+      insecure: true
+    resource_to_telemetry_conversion:
+      enabled: true
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      num_consumers: 10
+      queue_size: 5000
+
+  # ===================
+  # ClickHouse (local only - synced via ch-sync)
+  # ===================
+  clickhouse:
+    endpoint: tcp://clickhouse:9000
+    database: ast
+    ttl: 72h
+    create_schema: true
+    logs_table_name: otel_logs
+    traces_table_name: otel_traces
+    metrics_table_name: otel_metrics
+    timeout: 10s
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+  # ===================
+  # F5 Datafabric (optional)
+  # ===================
+  otlp/f5-datafabric:
+    endpoint: us.edge.df.f5.com:443
+    headers:
+      Authorization: "kovacs ${env:SENSOR_ID} ${env:SENSOR_SECRET_TOKEN}"
+      X-F5-OTEL: "GRPC"
+    tls:
+      insecure: false
+      ca_file: /etc/ssl/certs/ca-certificates.pem
+
+  # ===================
+  # Debug
+  # ===================
+  debug/bigip:
+    verbosity: basic
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+service:
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: '0.0.0.0'
+                port: 8888
+  pipelines: ${file:/etc/otel-collector-config/pipelines.yaml}
