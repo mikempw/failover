@@ -1,0 +1,31 @@
+# Grafana Datasource Provisioning
+# Place in: services/grafana/provisioning/datasources/datasources.yaml
+
+apiVersion: 1
+
+datasources:
+  # VictoriaMetrics (Prometheus-compatible)
+  - name: VictoriaMetrics
+    type: prometheus
+    access: proxy
+    url: http://victoriametrics:8428
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      timeInterval: "30s"
+
+  # ClickHouse
+  - name: ClickHouse
+    type: grafana-clickhouse-datasource
+    access: proxy
+    editable: false
+    jsonData:
+      defaultDatabase: ast
+      port: 9000
+      protocol: native
+      server: clickhouse
+      username: default
+      tlsSkipVerify: true
+    secureJsonData:
+      password: ""
