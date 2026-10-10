@@ -22,8 +22,10 @@ Environment-driven configuration for containers.
 """
 
 import argparse
+import ipaddress
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -344,7 +346,22 @@ class Config:
         
         if self.lease_ttl <= self.update_interval:
             errors.append(f"LEASE_TTL ({self.lease_ttl}) must be > UPDATE_INTERVAL ({self.update_interval})")
-        
+
+        # Values below are interpolated into nsupdate scripts and API calls.
+        # Reject anything that is not a plain hostname / IP so a stray newline
+        # or space cannot inject extra nsupdate commands.
+        for name, value in (('DNS_RECORD', self.dns_record), ('DNS_ZONE', self.dns_zone)):
+            if not is_valid_dns_name(value):
+                errors.append(f"Invalid {name}: {value!r}")
+        if self.provider in ('bind-tsig', 'ad-gss') and not (
+                is_valid_dns_name(self.dns_server) or is_valid_ip(self.dns_server)):
+            errors.append(f"Invalid DNS_SERVER: {self.dns_server!r}")
+        for name, value in (('PRIMARY_IP', self.primary_ip), ('DR_IP', self.dr_ip)):
+            if not is_valid_ip(value):
+                errors.append(f"Invalid {name}: {value!r}")
+        if self.primary_ip == self.dr_ip:
+            errors.append("PRIMARY_IP and DR_IP must differ")
+
         if errors:
             raise ValueError(f"Configuration errors: {'; '.join(errors)}")
 
@@ -371,6 +388,27 @@ def parse_txt(txt: str) -> Dict[str, str]:
     except Exception:
         pass
     return result
+
+_DNS_LABEL_RE = re.compile(r'^[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$')
+
+def is_valid_dns_name(name: Optional[str]) -> bool:
+    """True for a plain DNS name (labels of letters/digits/-/_), optional trailing dot."""
+    if not name or not isinstance(name, str) or len(name) > 253:
+        return False
+    labels = name[:-1].split('.') if name.endswith('.') else name.split('.')
+    return all(_DNS_LABEL_RE.match(label) for label in labels)
+
+def is_valid_ip(value: Optional[str]) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+class LeaseReadError(RuntimeError):
+    """The DNS provider could not be queried. Distinct from 'record absent'."""
+
 
 def check_tcp(host: str, port: int, timeout: int) -> bool:
     try:
@@ -407,37 +445,28 @@ def parse_metric_value(metrics_text: str, metric_name: str) -> Optional[float]:
     """
     if not metrics_text:
         return None
-    
+
+    # Exact name match only (so 'foo' does not also sum 'foo_total'), optional
+    # label set, value, optional timestamp.
+    pattern = re.compile(
+        r'^' + re.escape(metric_name) + r'(?:\{.*\})?\s+(\S+)(?:\s+-?\d+)?\s*$'
+    )
     total = 0.0
     found = False
-    
+
     for line in metrics_text.split('\n'):
         line = line.strip()
-        # Skip comments and empty lines
         if not line or line.startswith('#'):
             continue
-        
-        # Check if line starts with metric name
-        if line.startswith(metric_name):
-            try:
-                # Handle metrics with labels: metric_name{label="value"} 123
-                # Or without labels: metric_name 123
-                if '{' in line:
-                    # metric_name{labels} value
-                    value_part = line.split('}')[-1].strip()
-                else:
-                    # metric_name value
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        value_part = parts[1]
-                    else:
-                        continue
-                
-                total += float(value_part)
-                found = True
-            except (ValueError, IndexError):
-                continue
-    
+        m = pattern.match(line)
+        if not m:
+            continue
+        try:
+            total += float(m.group(1))
+            found = True
+        except ValueError:
+            continue
+
     return total if found else None
 
 
@@ -484,6 +513,13 @@ class MetricsHealthChecker:
             log(f"Metrics baseline: {self.metric_name}={current_value}")
             return True
         
+        # Counter went backwards: the collector restarted. Re-baseline without
+        # counting it as stale or as healthy; the next reading decides.
+        if current_value < self.last_value:
+            log(f"Metrics counter reset ({self.last_value} -> {current_value}), re-baselining", "WARN")
+            self.last_value = current_value
+            return self.stale_checks < self.stale_count
+
         # Compare with last value
         if current_value > self.last_value:
             # Value increasing - healthy
@@ -503,14 +539,30 @@ class MetricsHealthChecker:
 # -----------------------------
 
 class DNSProvider:
+    """
+    Provider contract:
+      set_records(ip, owner, exp_unix) -> None; raises on failure.
+      get_records() -> {'A': str|None, 'TXT': str|None}
+          None means the record does not exist.
+          Any failure to *query* the provider must raise (never return None),
+          so callers can tell "no lease" apart from "could not read the lease".
+    """
     def __init__(self, cfg: Config):
         self.cfg = cfg
-    
+
     def set_records(self, ip: str, owner: str, exp_unix: int) -> None:
         raise NotImplementedError
-    
+
     def get_records(self) -> Dict[str, Any]:
         raise NotImplementedError
+
+
+def select_lease_txt(values: List[str]) -> Optional[str]:
+    """Pick our lease TXT value (owner=... exp=...) out of all TXT values on the name."""
+    for v in values:
+        if v and 'owner=' in v:
+            return v
+    return None
 
 
 class DryRunProvider(DNSProvider):
@@ -521,7 +573,7 @@ class DryRunProvider(DNSProvider):
         with open(statefile, 'w') as f:
             json.dump(state, f, indent=2)
         log(f"[dry-run] Set A={ip}, TXT=owner={owner} exp={exp_unix}")
-    
+
     def get_records(self) -> Dict[str, Any]:
         statefile = self.cfg.dryrun_statefile or '/state/zone.json'
         try:
@@ -532,7 +584,54 @@ class DryRunProvider(DNSProvider):
             return {'A': None, 'TXT': None}
 
 
-class BindTSIGProvider(DNSProvider):
+_DIG_STATUS_RE = re.compile(r'status:\s*([A-Z]+)')
+_TXT_CHUNK_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+def dig_query(server: str, name: str, rtype: str, timeout: int = 5) -> List[str]:
+    """
+    Query `name` `rtype` at `server` with dig. Returns the answer values
+    (empty list for NXDOMAIN / no data). Raises LeaseReadError on SERVFAIL,
+    REFUSED, timeouts or dig errors.
+    """
+    proc = subprocess.run(
+        ['dig', f'@{server}', name, rtype, '+noall', '+comments', '+answer', '+time=2', '+tries=2'],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    if proc.returncode != 0:
+        raise LeaseReadError(f"dig {rtype} failed (rc={proc.returncode}): {proc.stdout.strip() or proc.stderr.strip()}")
+    m = _DIG_STATUS_RE.search(proc.stdout)
+    if not m:
+        raise LeaseReadError(f"dig {rtype}: no response status in output")
+    status = m.group(1)
+    if status == 'NXDOMAIN':
+        return []
+    if status != 'NOERROR':
+        raise LeaseReadError(f"dig {rtype}: DNS status {status}")
+
+    values = []
+    for line in proc.stdout.splitlines():
+        if not line.strip() or line.startswith(';'):
+            continue
+        parts = line.split(None, 4)
+        # name ttl class type rdata
+        if len(parts) < 5 or parts[3].upper() != rtype.upper():
+            continue
+        rdata = parts[4].strip()
+        if rtype.upper() == 'TXT':
+            chunks = _TXT_CHUNK_RE.findall(rdata)
+            values.append(''.join(chunks) if chunks else rdata)
+        else:
+            values.append(rdata)
+    return values
+
+
+class NsupdateProvider(DNSProvider):
+    """RFC2136 dynamic update via nsupdate; reads via dig against the same server."""
+    label = 'nsupdate'
+
+    def nsupdate_args(self) -> List[str]:
+        raise NotImplementedError
+
     def set_records(self, ip: str, owner: str, exp_unix: int) -> None:
         txt_value = f"owner={owner} exp={exp_unix}"
         commands = f"""server {self.cfg.dns_server}
@@ -543,59 +642,29 @@ update add {self.cfg.dns_record} {self.cfg.dns_ttl} A {ip}
 update add {self.cfg.dns_record} {self.cfg.dns_ttl} TXT "{txt_value}"
 send
 """
-        result = subprocess.run(['nsupdate', '-k', self.cfg.tsig_keyfile], input=commands, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(self.nsupdate_args(), input=commands, capture_output=True, text=True, timeout=10)
         if result.returncode != 0:
             raise RuntimeError(f"nsupdate failed: {result.stderr}")
-        log(f"[bind-tsig] Set A={ip}, TXT={txt_value}")
-    
+        log(f"[{self.label}] Set A={ip}, TXT={txt_value}")
+
     def get_records(self) -> Dict[str, Any]:
-        result = {'A': None, 'TXT': None}
-        try:
-            proc = subprocess.run(['dig', f'@{self.cfg.dns_server}', self.cfg.dns_record, 'A', '+short'], capture_output=True, text=True, timeout=5)
-            if proc.returncode == 0 and proc.stdout.strip():
-                result['A'] = proc.stdout.strip().split('\n')[0]
-        except Exception as e:
-            log(f"Failed to query A record: {e}", "WARN")
-        try:
-            proc = subprocess.run(['dig', f'@{self.cfg.dns_server}', self.cfg.dns_record, 'TXT', '+short'], capture_output=True, text=True, timeout=5)
-            if proc.returncode == 0 and proc.stdout.strip():
-                result['TXT'] = proc.stdout.strip().replace('"', '')
-        except Exception as e:
-            log(f"Failed to query TXT record: {e}", "WARN")
-        return result
+        a_values = dig_query(self.cfg.dns_server, self.cfg.dns_record, 'A')
+        txt_values = dig_query(self.cfg.dns_server, self.cfg.dns_record, 'TXT')
+        return {'A': a_values[0] if a_values else None, 'TXT': select_lease_txt(txt_values)}
 
 
-class ADGSSProvider(DNSProvider):
-    def set_records(self, ip: str, owner: str, exp_unix: int) -> None:
-        txt_value = f"owner={owner} exp={exp_unix}"
-        commands = f"""server {self.cfg.dns_server}
-zone {self.cfg.dns_zone}
-update delete {self.cfg.dns_record} A
-update delete {self.cfg.dns_record} TXT
-update add {self.cfg.dns_record} {self.cfg.dns_ttl} A {ip}
-update add {self.cfg.dns_record} {self.cfg.dns_ttl} TXT "{txt_value}"
-send
-"""
-        result = subprocess.run(['nsupdate', '-g'], input=commands, capture_output=True, text=True, timeout=10)
-        if result.returncode != 0:
-            raise RuntimeError(f"nsupdate (GSS) failed: {result.stderr}")
-        log(f"[ad-gss] Set A={ip}, TXT={txt_value}")
-    
-    def get_records(self) -> Dict[str, Any]:
-        result = {'A': None, 'TXT': None}
-        try:
-            proc = subprocess.run(['dig', f'@{self.cfg.dns_server}', self.cfg.dns_record, 'A', '+short'], capture_output=True, text=True, timeout=5)
-            if proc.returncode == 0 and proc.stdout.strip():
-                result['A'] = proc.stdout.strip().split('\n')[0]
-        except Exception as e:
-            log(f"Failed to query A record: {e}", "WARN")
-        try:
-            proc = subprocess.run(['dig', f'@{self.cfg.dns_server}', self.cfg.dns_record, 'TXT', '+short'], capture_output=True, text=True, timeout=5)
-            if proc.returncode == 0 and proc.stdout.strip():
-                result['TXT'] = proc.stdout.strip().replace('"', '')
-        except Exception as e:
-            log(f"Failed to query TXT record: {e}", "WARN")
-        return result
+class BindTSIGProvider(NsupdateProvider):
+    label = 'bind-tsig'
+
+    def nsupdate_args(self) -> List[str]:
+        return ['nsupdate', '-k', self.cfg.tsig_keyfile]
+
+
+class ADGSSProvider(NsupdateProvider):
+    label = 'ad-gss'
+
+    def nsupdate_args(self) -> List[str]:
+        return ['nsupdate', '-g']
 
 
 class InfobloxProvider(DNSProvider):
@@ -606,49 +675,46 @@ class InfobloxProvider(DNSProvider):
         self.session.auth = (cfg.infoblox_username, cfg.infoblox_password)
         self.session.verify = cfg.infoblox_verify_ssl
         self.base_url = f"https://{cfg.infoblox_host}/wapi/{cfg.infoblox_wapi_version}"
-    
-    def _find_record(self, record_type: str) -> Optional[str]:
-        url = f"{self.base_url}/record:{record_type.lower()}"
-        params = {'name': self.cfg.dns_record, 'zone': self.cfg.dns_zone}
+
+    def _search(self, record_type: str, fields: str) -> List[Dict]:
+        url = f"{self.base_url}/record:{record_type}"
+        params = {'name': self.cfg.dns_record, 'zone': self.cfg.dns_zone, '_return_fields': fields}
         resp = self.session.get(url, params=params, timeout=10)
         resp.raise_for_status()
-        records = resp.json()
-        return records[0]['_ref'] if records else None
-    
+        return resp.json()
+
+    def _a_record(self) -> Optional[Dict]:
+        records = self._search('a', 'ipv4addr')
+        return records[0] if records else None
+
+    def _txt_record(self) -> Optional[Dict]:
+        for rec in self._search('txt', 'text'):
+            if 'owner=' in (rec.get('text') or ''):
+                return rec
+        return None
+
     def set_records(self, ip: str, owner: str, exp_unix: int) -> None:
         txt_value = f"owner={owner} exp={exp_unix}"
-        a_ref = self._find_record('A')
-        if a_ref:
-            self.session.put(f"{self.base_url}/{a_ref}", json={'ipv4addr': ip, 'ttl': self.cfg.dns_ttl}, timeout=10).raise_for_status()
+        a_rec = self._a_record()
+        if a_rec:
+            self.session.put(f"{self.base_url}/{a_rec['_ref']}", json={'ipv4addr': ip, 'ttl': self.cfg.dns_ttl, 'use_ttl': True}, timeout=10).raise_for_status()
         else:
-            self.session.post(f"{self.base_url}/record:a", json={'name': self.cfg.dns_record, 'ipv4addr': ip, 'ttl': self.cfg.dns_ttl, 'zone': self.cfg.dns_zone}, timeout=10).raise_for_status()
-        
-        txt_ref = self._find_record('TXT')
-        if txt_ref:
-            self.session.put(f"{self.base_url}/{txt_ref}", json={'text': txt_value, 'ttl': self.cfg.dns_ttl}, timeout=10).raise_for_status()
+            self.session.post(f"{self.base_url}/record:a", json={'name': self.cfg.dns_record, 'ipv4addr': ip, 'ttl': self.cfg.dns_ttl, 'use_ttl': True}, timeout=10).raise_for_status()
+
+        txt_rec = self._txt_record()
+        if txt_rec:
+            self.session.put(f"{self.base_url}/{txt_rec['_ref']}", json={'text': txt_value, 'ttl': self.cfg.dns_ttl, 'use_ttl': True}, timeout=10).raise_for_status()
         else:
-            self.session.post(f"{self.base_url}/record:txt", json={'name': self.cfg.dns_record, 'text': txt_value, 'ttl': self.cfg.dns_ttl, 'zone': self.cfg.dns_zone}, timeout=10).raise_for_status()
+            self.session.post(f"{self.base_url}/record:txt", json={'name': self.cfg.dns_record, 'text': txt_value, 'ttl': self.cfg.dns_ttl, 'use_ttl': True}, timeout=10).raise_for_status()
         log(f"[infoblox] Set A={ip}, TXT={txt_value}")
-    
+
     def get_records(self) -> Dict[str, Any]:
-        result = {'A': None, 'TXT': None}
-        try:
-            a_ref = self._find_record('A')
-            if a_ref:
-                resp = self.session.get(f"{self.base_url}/{a_ref}", params={'_return_fields': 'ipv4addr'}, timeout=10)
-                resp.raise_for_status()
-                result['A'] = resp.json().get('ipv4addr')
-        except Exception as e:
-            log(f"Failed to query A record: {e}", "WARN")
-        try:
-            txt_ref = self._find_record('TXT')
-            if txt_ref:
-                resp = self.session.get(f"{self.base_url}/{txt_ref}", params={'_return_fields': 'text'}, timeout=10)
-                resp.raise_for_status()
-                result['TXT'] = resp.json().get('text')
-        except Exception as e:
-            log(f"Failed to query TXT record: {e}", "WARN")
-        return result
+        a_rec = self._a_record()
+        txt_rec = self._txt_record()
+        return {
+            'A': a_rec.get('ipv4addr') if a_rec else None,
+            'TXT': txt_rec.get('text') if txt_rec else None,
+        }
 
 
 class CloudflareProvider(DNSProvider):
@@ -659,53 +725,55 @@ class CloudflareProvider(DNSProvider):
         self.session.headers.update({'Authorization': f'Bearer {cfg.cloudflare_api_token}', 'Content-Type': 'application/json'})
         self.base_url = "https://api.cloudflare.com/client/v4"
         self.zone_id = cfg.cloudflare_zone_id
-    
-    def _find_record(self, record_type: str) -> Optional[Dict]:
+
+    def _list(self, record_type: str) -> List[Dict]:
         url = f"{self.base_url}/zones/{self.zone_id}/dns_records"
         params = {'type': record_type, 'name': self.cfg.dns_record}
         resp = self.session.get(url, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        if data['success'] and data['result']:
-            return data['result'][0]
+        if not data.get('success'):
+            raise LeaseReadError(f"Cloudflare API error: {data.get('errors')}")
+        return data.get('result') or []
+
+    def _a_record(self) -> Optional[Dict]:
+        records = self._list('A')
+        return records[0] if records else None
+
+    def _txt_record(self) -> Optional[Dict]:
+        # The name may carry other TXT records (SPF, verification); only touch ours.
+        for rec in self._list('TXT'):
+            if 'owner=' in rec.get('content', ''):
+                return rec
         return None
-    
+
     def set_records(self, ip: str, owner: str, exp_unix: int) -> None:
         txt_value = f"owner={owner} exp={exp_unix}"
-        
-        a_record = self._find_record('A')
+        records_url = f"{self.base_url}/zones/{self.zone_id}/dns_records"
+
+        a_record = self._a_record()
+        a_body = {'type': 'A', 'name': self.cfg.dns_record, 'content': ip, 'ttl': self.cfg.dns_ttl}
         if a_record:
-            url = f"{self.base_url}/zones/{self.zone_id}/dns_records/{a_record['id']}"
-            self.session.put(url, json={'type': 'A', 'name': self.cfg.dns_record, 'content': ip, 'ttl': self.cfg.dns_ttl}, timeout=10).raise_for_status()
+            self.session.put(f"{records_url}/{a_record['id']}", json=a_body, timeout=10).raise_for_status()
         else:
-            url = f"{self.base_url}/zones/{self.zone_id}/dns_records"
-            self.session.post(url, json={'type': 'A', 'name': self.cfg.dns_record, 'content': ip, 'ttl': self.cfg.dns_ttl}, timeout=10).raise_for_status()
-        
-        txt_record = self._find_record('TXT')
+            self.session.post(records_url, json=a_body, timeout=10).raise_for_status()
+
+        txt_record = self._txt_record()
+        txt_body = {'type': 'TXT', 'name': self.cfg.dns_record, 'content': txt_value, 'ttl': self.cfg.dns_ttl}
         if txt_record:
-            url = f"{self.base_url}/zones/{self.zone_id}/dns_records/{txt_record['id']}"
-            self.session.put(url, json={'type': 'TXT', 'name': self.cfg.dns_record, 'content': txt_value, 'ttl': self.cfg.dns_ttl}, timeout=10).raise_for_status()
+            self.session.put(f"{records_url}/{txt_record['id']}", json=txt_body, timeout=10).raise_for_status()
         else:
-            url = f"{self.base_url}/zones/{self.zone_id}/dns_records"
-            self.session.post(url, json={'type': 'TXT', 'name': self.cfg.dns_record, 'content': txt_value, 'ttl': self.cfg.dns_ttl}, timeout=10).raise_for_status()
-        
+            self.session.post(records_url, json=txt_body, timeout=10).raise_for_status()
+
         log(f"[cloudflare] Set A={ip}, TXT={txt_value}")
-    
+
     def get_records(self) -> Dict[str, Any]:
-        result = {'A': None, 'TXT': None}
-        try:
-            a_record = self._find_record('A')
-            if a_record:
-                result['A'] = a_record['content']
-        except Exception as e:
-            log(f"Failed to query A record: {e}", "WARN")
-        try:
-            txt_record = self._find_record('TXT')
-            if txt_record:
-                result['TXT'] = txt_record['content']
-        except Exception as e:
-            log(f"Failed to query TXT record: {e}", "WARN")
-        return result
+        a_record = self._a_record()
+        txt_record = self._txt_record()
+        return {
+            'A': a_record['content'] if a_record else None,
+            'TXT': txt_record['content'] if txt_record else None,
+        }
 
 
 class Route53Provider(DNSProvider):
@@ -715,8 +783,9 @@ class Route53Provider(DNSProvider):
         self.client = boto3.client('route53', aws_access_key_id=cfg.aws_access_key_id, aws_secret_access_key=cfg.aws_secret_access_key, region_name=cfg.aws_region)
         self.zone_id = cfg.route53_zone_id
         self.record_name = cfg.dns_record if cfg.dns_record.endswith('.') else f"{cfg.dns_record}."
-    
+
     def set_records(self, ip: str, owner: str, exp_unix: int) -> None:
+        # Note: UPSERT replaces the whole TXT set on this name.
         txt_value = f'"owner={owner} exp={exp_unix}"'
         changes = [
             {'Action': 'UPSERT', 'ResourceRecordSet': {'Name': self.record_name, 'Type': 'A', 'TTL': self.cfg.dns_ttl, 'ResourceRecords': [{'Value': ip}]}},
@@ -724,121 +793,134 @@ class Route53Provider(DNSProvider):
         ]
         self.client.change_resource_record_sets(HostedZoneId=self.zone_id, ChangeBatch={'Changes': changes})
         log(f"[route53] Set A={ip}, TXT=owner={owner} exp={exp_unix}")
-    
+
     def get_records(self) -> Dict[str, Any]:
         result = {'A': None, 'TXT': None}
-        try:
-            resp = self.client.list_resource_record_sets(HostedZoneId=self.zone_id, StartRecordName=self.record_name, MaxItems='10')
-            for rs in resp.get('ResourceRecordSets', []):
-                if rs['Name'] == self.record_name:
-                    if rs['Type'] == 'A':
-                        result['A'] = rs['ResourceRecords'][0]['Value']
-                    elif rs['Type'] == 'TXT':
-                        result['TXT'] = rs['ResourceRecords'][0]['Value'].strip('"')
-        except Exception as e:
-            log(f"Failed to query records: {e}", "WARN")
+        resp = self.client.list_resource_record_sets(HostedZoneId=self.zone_id, StartRecordName=self.record_name, MaxItems='10')
+        for rs in resp.get('ResourceRecordSets', []):
+            if rs['Name'] != self.record_name:
+                continue
+            values = [r['Value'] for r in rs.get('ResourceRecords', [])]
+            if rs['Type'] == 'A' and values:
+                result['A'] = values[0]
+            elif rs['Type'] == 'TXT':
+                unquoted = [''.join(_TXT_CHUNK_RE.findall(v)) or v.strip('"') for v in values]
+                result['TXT'] = select_lease_txt(unquoted)
         return result
 
 
 class AzureDNSProvider(DNSProvider):
+    API_VERSION = "2018-05-01"
+    TOKEN_REFRESH_MARGIN = 300  # seconds before expiry to refresh
+
     def __init__(self, cfg: Config):
         super().__init__(cfg)
         import requests
+        self._requests = requests
         self.session = requests.Session()
-        self.cfg = cfg
+        self.session.headers.update({'Content-Type': 'application/json'})
         self.base_url = f"https://management.azure.com/subscriptions/{cfg.azure_subscription_id}/resourceGroups/{cfg.azure_resource_group}/providers/Microsoft.Network/dnsZones/{cfg.dns_zone}"
-        self._authenticate()
-    
-    def _authenticate(self):
-        import requests
+        self._token_expires_at = 0.0
+        self._ensure_token()
+
+    def _ensure_token(self):
+        """Fetch a client-credentials token, refreshing before it expires (tokens last ~1h)."""
+        if time.time() < self._token_expires_at - self.TOKEN_REFRESH_MARGIN:
+            return
         url = f"https://login.microsoftonline.com/{self.cfg.azure_tenant_id}/oauth2/v2.0/token"
         data = {'grant_type': 'client_credentials', 'client_id': self.cfg.azure_client_id, 'client_secret': self.cfg.azure_client_secret, 'scope': 'https://management.azure.com/.default'}
-        resp = requests.post(url, data=data, timeout=10)
+        resp = self._requests.post(url, data=data, timeout=10)
         resp.raise_for_status()
-        token = resp.json()['access_token']
-        self.session.headers.update({'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'})
-    
+        body = resp.json()
+        self.session.headers['Authorization'] = f"Bearer {body['access_token']}"
+        self._token_expires_at = time.time() + int(body.get('expires_in', 3600))
+
     def _get_record_name(self) -> str:
-        if self.cfg.dns_record.endswith(self.cfg.dns_zone):
-            return self.cfg.dns_record[:-len(self.cfg.dns_zone)-1]
-        return self.cfg.dns_record
-    
+        record = self.cfg.dns_record.rstrip('.')
+        zone = self.cfg.dns_zone.rstrip('.')
+        if record == zone:
+            return '@'
+        if record.endswith('.' + zone):
+            return record[:-len(zone) - 1]
+        return record
+
     def set_records(self, ip: str, owner: str, exp_unix: int) -> None:
+        self._ensure_token()
         txt_value = f"owner={owner} exp={exp_unix}"
         record_name = self._get_record_name()
-        api_version = "2018-05-01"
-        
-        self.session.put(f"{self.base_url}/A/{record_name}?api-version={api_version}", json={'properties': {'TTL': self.cfg.dns_ttl, 'ARecords': [{'ipv4Address': ip}]}}, timeout=10).raise_for_status()
-        self.session.put(f"{self.base_url}/TXT/{record_name}?api-version={api_version}", json={'properties': {'TTL': self.cfg.dns_ttl, 'TXTRecords': [{'value': [txt_value]}]}}, timeout=10).raise_for_status()
+
+        self.session.put(f"{self.base_url}/A/{record_name}?api-version={self.API_VERSION}", json={'properties': {'TTL': self.cfg.dns_ttl, 'ARecords': [{'ipv4Address': ip}]}}, timeout=10).raise_for_status()
+        self.session.put(f"{self.base_url}/TXT/{record_name}?api-version={self.API_VERSION}", json={'properties': {'TTL': self.cfg.dns_ttl, 'TXTRecords': [{'value': [txt_value]}]}}, timeout=10).raise_for_status()
         log(f"[azure-dns] Set A={ip}, TXT={txt_value}")
-    
+
+    def _get(self, rtype: str) -> Optional[Dict]:
+        resp = self.session.get(f"{self.base_url}/{rtype}/{self._get_record_name()}?api-version={self.API_VERSION}", timeout=10)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json().get('properties', {})
+
     def get_records(self) -> Dict[str, Any]:
+        self._ensure_token()
         result = {'A': None, 'TXT': None}
-        record_name = self._get_record_name()
-        api_version = "2018-05-01"
-        try:
-            resp = self.session.get(f"{self.base_url}/A/{record_name}?api-version={api_version}", timeout=10)
-            if resp.status_code == 200:
-                records = resp.json().get('properties', {}).get('ARecords', [])
-                if records:
-                    result['A'] = records[0]['ipv4Address']
-        except Exception as e:
-            log(f"Failed to query A record: {e}", "WARN")
-        try:
-            resp = self.session.get(f"{self.base_url}/TXT/{record_name}?api-version={api_version}", timeout=10)
-            if resp.status_code == 200:
-                records = resp.json().get('properties', {}).get('TXTRecords', [])
-                if records and records[0].get('value'):
-                    result['TXT'] = records[0]['value'][0]
-        except Exception as e:
-            log(f"Failed to query TXT record: {e}", "WARN")
+        a_props = self._get('A')
+        if a_props and a_props.get('ARecords'):
+            result['A'] = a_props['ARecords'][0]['ipv4Address']
+        txt_props = self._get('TXT')
+        if txt_props:
+            values = [''.join(r.get('value') or []) for r in txt_props.get('TXTRecords', [])]
+            result['TXT'] = select_lease_txt(values)
         return result
 
 
 class GCPDNSProvider(DNSProvider):
+    CHANGE_TIMEOUT = 120  # seconds to wait for a change to apply
+
     def __init__(self, cfg: Config):
         super().__init__(cfg)
         from google.cloud import dns
         from google.oauth2 import service_account
-        
+
         if cfg.gcp_credentials_file:
             credentials = service_account.Credentials.from_service_account_file(cfg.gcp_credentials_file)
             self.client = dns.Client(project=cfg.gcp_project_id, credentials=credentials)
         else:
             self.client = dns.Client(project=cfg.gcp_project_id)
-        
+
         self.zone = self.client.zone(cfg.gcp_managed_zone)
         self.record_name = cfg.dns_record if cfg.dns_record.endswith('.') else f"{cfg.dns_record}."
-    
+
     def set_records(self, ip: str, owner: str, exp_unix: int) -> None:
         txt_value = f'"owner={owner} exp={exp_unix}"'
         changes = self.zone.changes()
-        
+
         for record_set in self.zone.list_resource_record_sets():
             if record_set.name == self.record_name and record_set.record_type in ('A', 'TXT'):
                 changes.delete_record_set(record_set)
-        
+
         changes.add_record_set(self.zone.resource_record_set(self.record_name, 'A', self.cfg.dns_ttl, [ip]))
         changes.add_record_set(self.zone.resource_record_set(self.record_name, 'TXT', self.cfg.dns_ttl, [txt_value]))
         changes.create()
-        
+
+        deadline = time.time() + self.CHANGE_TIMEOUT
         while changes.status != 'done':
+            if time.time() > deadline:
+                raise RuntimeError(f"GCP DNS change not applied after {self.CHANGE_TIMEOUT}s (status={changes.status})")
             time.sleep(0.5)
             changes.reload()
-        
+
         log(f"[gcp-dns] Set A={ip}, TXT=owner={owner} exp={exp_unix}")
-    
+
     def get_records(self) -> Dict[str, Any]:
         result = {'A': None, 'TXT': None}
-        try:
-            for record_set in self.zone.list_resource_record_sets():
-                if record_set.name == self.record_name:
-                    if record_set.record_type == 'A':
-                        result['A'] = record_set.rrdatas[0]
-                    elif record_set.record_type == 'TXT':
-                        result['TXT'] = record_set.rrdatas[0].strip('"')
-        except Exception as e:
-            log(f"Failed to query records: {e}", "WARN")
+        for record_set in self.zone.list_resource_record_sets():
+            if record_set.name != self.record_name:
+                continue
+            if record_set.record_type == 'A' and record_set.rrdatas:
+                result['A'] = record_set.rrdatas[0]
+            elif record_set.record_type == 'TXT':
+                values = [''.join(_TXT_CHUNK_RE.findall(v)) or v.strip('"') for v in record_set.rrdatas]
+                result['TXT'] = select_lease_txt(values)
         return result
 
 
@@ -853,70 +935,73 @@ class F5GTMProvider(DNSProvider):
         self.base_url = f"https://{cfg.f5_host}/mgmt/tm"
         self.partition = cfg.f5_partition
         self.datagroup_name = "dns_failover_lease"
-    
+
+    def _datagroup_url(self) -> str:
+        return f"{self.base_url}/ltm/data-group/internal/~{self.partition}~{self.datagroup_name}"
+
     def _ensure_datagroup(self):
-        url = f"{self.base_url}/ltm/data-group/internal/~{self.partition}~{self.datagroup_name}"
-        resp = self.session.get(url, timeout=10)
+        resp = self.session.get(self._datagroup_url(), timeout=10)
         if resp.status_code == 404:
             url = f"{self.base_url}/ltm/data-group/internal"
             self.session.post(url, json={'name': self.datagroup_name, 'partition': self.partition, 'type': 'string'}, timeout=10).raise_for_status()
-    
+        else:
+            resp.raise_for_status()
+
     def set_records(self, ip: str, owner: str, exp_unix: int) -> None:
         self._ensure_datagroup()
-        url = f"{self.base_url}/ltm/data-group/internal/~{self.partition}~{self.datagroup_name}"
         data = {'records': [{'name': 'owner', 'data': owner}, {'name': 'exp', 'data': str(exp_unix)}, {'name': 'ip', 'data': ip}]}
-        self.session.patch(url, json=data, timeout=10).raise_for_status()
-        
+        self.session.patch(self._datagroup_url(), json=data, timeout=10).raise_for_status()
+
         if self.cfg.f5_pool_name:
             pool_url = f"{self.base_url}/gtm/pool/a/~{self.partition}~{self.cfg.f5_pool_name}/members"
             resp = self.session.get(pool_url, timeout=10)
-            if resp.status_code == 200:
-                for member in resp.json().get('items', []):
-                    member_url = f"{self.base_url}/gtm/pool/a/~{self.partition}~{self.cfg.f5_pool_name}/members/{member['name']}"
-                    member_ip = member.get('address', '').split('%')[0]
-                    if member_ip == ip:
-                        self.session.patch(member_url, json={'enabled': True}, timeout=10)
-                    else:
-                        self.session.patch(member_url, json={'disabled': True}, timeout=10)
-        
+            resp.raise_for_status()
+            # Enable the target member before disabling others so the pool is never empty.
+            members = resp.json().get('items', [])
+            members.sort(key=lambda m: m.get('address', '').split('%')[0] != ip)
+            for member in members:
+                member_url = f"{pool_url}/{member['name']}"
+                member_ip = member.get('address', '').split('%')[0]
+                body = {'enabled': True} if member_ip == ip else {'disabled': True}
+                self.session.patch(member_url, json=body, timeout=10).raise_for_status()
+
         log(f"[f5-gtm] Set active={ip}, owner={owner}, exp={exp_unix}")
-    
+
     def get_records(self) -> Dict[str, Any]:
         result = {'A': None, 'TXT': None}
-        try:
-            self._ensure_datagroup()
-            url = f"{self.base_url}/ltm/data-group/internal/~{self.partition}~{self.datagroup_name}"
-            resp = self.session.get(url, timeout=10)
-            resp.raise_for_status()
-            records = {r['name']: r.get('data', '') for r in resp.json().get('records', [])}
-            result['A'] = records.get('ip')
-            if 'owner' in records and 'exp' in records:
-                result['TXT'] = f"owner={records['owner']} exp={records['exp']}"
-        except Exception as e:
-            log(f"Failed to query F5 data group: {e}", "WARN")
+        resp = self.session.get(self._datagroup_url(), timeout=10)
+        if resp.status_code == 404:
+            return result
+        resp.raise_for_status()
+        records = {r['name']: r.get('data', '') for r in resp.json().get('records', [])}
+        result['A'] = records.get('ip')
+        if 'owner' in records and 'exp' in records:
+            result['TXT'] = f"owner={records['owner']} exp={records['exp']}"
         return result
 
 
 class ScriptProvider(DNSProvider):
     """
     Custom script provider for unsupported DNS platforms.
-    
+
     Allows users to integrate ANY DNS system by providing two scripts:
-    
+
     1. SCRIPT_SET - Called when DNS needs to be updated
        Arguments: $1=record $2=ip $3=owner $4=expiry_unix $5=ttl $6=zone
        Example:   ./set_dns.sh syslog.example.com 10.10.10.10 primary 1699567890 30 example.com
        Exit 0 on success, non-zero on failure
-    
-    2. SCRIPT_GET - Called to query current DNS state  
+
+    2. SCRIPT_GET - Called to query current DNS state
        Arguments: $1=record $2=zone
        Example:   ./get_dns.sh syslog.example.com example.com
        Output:    JSON on stdout: {"A": "10.10.10.10", "TXT": "owner=primary exp=1699567890"}
-       Exit 0 on success, non-zero on failure
-    
+                  Use null / omit keys when the record does not exist.
+       Exit 0 on success, non-zero on failure (treated as "could not read",
+       which never triggers a failover by itself)
+
     Scripts can be written in any language (bash, python, powershell, etc.)
     """
-    
+
     def set_records(self, ip: str, owner: str, exp_unix: int) -> None:
         """Call the set script with DNS update parameters."""
         args = [
@@ -928,7 +1013,7 @@ class ScriptProvider(DNSProvider):
             str(self.cfg.dns_ttl),    # $5 - TTL in seconds
             self.cfg.dns_zone         # $6 - DNS zone
         ]
-        
+
         # Also pass as environment variables for convenience
         env = os.environ.copy()
         env.update({
@@ -940,7 +1025,7 @@ class ScriptProvider(DNSProvider):
             'DNS_ZONE': self.cfg.dns_zone,
             'DNS_SERVER': self.cfg.dns_server,
         })
-        
+
         result = subprocess.run(
             args,
             capture_output=True,
@@ -948,58 +1033,46 @@ class ScriptProvider(DNSProvider):
             timeout=30,
             env=env
         )
-        
+
         if result.returncode != 0:
             error_msg = result.stderr.strip() or result.stdout.strip() or f"Exit code {result.returncode}"
             raise RuntimeError(f"SCRIPT_SET failed: {error_msg}")
-        
+
         log(f"[script] Set A={ip}, owner={owner}, exp={exp_unix}")
-    
+
     def get_records(self) -> Dict[str, Any]:
         """Call the get script to query current DNS state."""
-        result = {'A': None, 'TXT': None}
-        
         args = [
             self.cfg.script_get,
             self.cfg.dns_record,      # $1 - FQDN to query
             self.cfg.dns_zone         # $2 - DNS zone
         ]
-        
+
         env = os.environ.copy()
         env.update({
             'DNS_RECORD': self.cfg.dns_record,
             'DNS_ZONE': self.cfg.dns_zone,
             'DNS_SERVER': self.cfg.dns_server,
         })
-        
+
         try:
-            proc = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env=env
-            )
-            
-            if proc.returncode != 0:
-                log(f"SCRIPT_GET failed: {proc.stderr.strip() or proc.stdout.strip()}", "WARN")
-                return result
-            
-            # Parse JSON output
-            output = proc.stdout.strip()
-            if output:
-                data = json.loads(output)
-                result['A'] = data.get('A')
-                result['TXT'] = data.get('TXT')
-        
-        except json.JSONDecodeError as e:
-            log(f"SCRIPT_GET returned invalid JSON: {e}", "WARN")
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=30, env=env)
         except subprocess.TimeoutExpired:
-            log("SCRIPT_GET timed out", "WARN")
-        except Exception as e:
-            log(f"SCRIPT_GET error: {e}", "WARN")
-        
-        return result
+            raise LeaseReadError("SCRIPT_GET timed out")
+
+        if proc.returncode != 0:
+            raise LeaseReadError(f"SCRIPT_GET failed: {proc.stderr.strip() or proc.stdout.strip() or proc.returncode}")
+
+        output = proc.stdout.strip()
+        if not output:
+            return {'A': None, 'TXT': None}
+        try:
+            data = json.loads(output)
+        except json.JSONDecodeError as e:
+            raise LeaseReadError(f"SCRIPT_GET returned invalid JSON: {e}")
+        if not isinstance(data, dict):
+            raise LeaseReadError("SCRIPT_GET must return a JSON object")
+        return {'A': data.get('A'), 'TXT': data.get('TXT')}
 
 
 def build_provider(cfg: Config) -> DNSProvider:
@@ -1023,6 +1096,58 @@ def build_provider(cfg: Config) -> DNSProvider:
 # Core Operations
 # -----------------------------
 
+@dataclass
+class Lease:
+    ip: Optional[str]
+    owner: Optional[str]
+    exp: int  # 0 when absent / unparseable
+
+def read_lease(provider: DNSProvider) -> Lease:
+    """Read the current lease. Raises LeaseReadError if the provider can't be queried."""
+    try:
+        records = provider.get_records()
+    except LeaseReadError:
+        raise
+    except Exception as e:
+        raise LeaseReadError(str(e)) from e
+    txt = parse_txt(records.get('TXT'))
+    try:
+        exp = int(txt.get('exp') or 0)
+    except ValueError:
+        exp = 0
+    return Lease(ip=records.get('A'), owner=txt.get('owner'), exp=exp)
+
+
+# Decisions are pure functions so they can be unit-tested without timing loops.
+
+def decide_primary(lease: Lease, now: int) -> str:
+    """
+    Primary heartbeat decision (only called when primary considers itself healthy).
+      'renew'   - write primary lease
+      'yield'   - DR holds a live lease; leave it (manual 'failback' reclaims)
+      'reclaim' - DR owns the lease but stopped renewing it (DR is down); take it back
+    """
+    if lease.owner == 'dr':
+        return 'yield' if lease.exp >= now else 'reclaim'
+    return 'renew'
+
+def decide_dr(lease: Lease, now: int, primary_failed: bool) -> str:
+    """
+    DR heartbeat decision.
+      'renew'   - DR owns the lease; keep it alive until a manual failback
+      'promote' - primary failed and its lease expired; take over
+      'wait'    - primary failed but its lease is still live
+      'idle'    - nothing to do
+    """
+    if lease.owner == 'dr':
+        return 'renew'
+    if not primary_failed:
+        return 'idle'
+    if lease.exp < now:
+        return 'promote'
+    return 'wait'
+
+
 def init_dns(cfg: Config, provider: DNSProvider):
     exp = now_unix() + cfg.lease_ttl
     provider.set_records(cfg.primary_ip, 'primary', exp)
@@ -1039,21 +1164,47 @@ def failback_to_primary(cfg: Config, provider: DNSProvider):
     log(f"FAILBACK: Restored primary as active, A={cfg.primary_ip}")
 
 def show_dns(cfg: Config, provider: DNSProvider):
-    records = provider.get_records()
-    txt_data = parse_txt(records.get('TXT'))
-    exp_unix = int(txt_data.get('exp', '0')) if txt_data.get('exp') else 0
-    time_remaining = exp_unix - now_unix() if exp_unix else None
-    print(json.dumps({'record': cfg.dns_record, 'A': records.get('A'), 'owner': txt_data.get('owner'), 'expires_at': txt_data.get('exp'), 'time_remaining': time_remaining}, indent=2))
+    lease = read_lease(provider)
+    time_remaining = lease.exp - now_unix() if lease.exp else None
+    print(json.dumps({'record': cfg.dns_record, 'A': lease.ip, 'owner': lease.owner, 'expires_at': lease.exp or None, 'time_remaining': time_remaining}, indent=2))
 
 # -----------------------------
 # Heartbeat Loops
 # -----------------------------
 
+def primary_tick(cfg: Config, provider: DNSProvider, self_health_checker: Optional['MetricsHealthChecker']) -> str:
+    """One primary heartbeat iteration. Returns the action taken (for logging/tests)."""
+    if self_health_checker and not self_health_checker.check():
+        log("Local OTEL unhealthy - NOT renewing lease (will expire)", "WARN")
+        return 'unhealthy'
+
+    try:
+        lease = read_lease(provider)
+    except LeaseReadError as e:
+        # Don't write blind: if DR holds the lease we'd overwrite it and flap.
+        log(f"Cannot read lease ({e}) - skipping renewal this cycle", "WARN")
+        return 'read-error'
+
+    action = decide_primary(lease, now_unix())
+    if action == 'yield':
+        log("DR currently owns lease - not overwriting (run 'failback' to reclaim)", "WARN")
+        return action
+    if action == 'reclaim':
+        log(f"DR lease expired at {lease.exp} (DR stopped renewing) - reclaiming", "WARN")
+
+    try:
+        exp = now_unix() + cfg.lease_ttl
+        provider.set_records(cfg.primary_ip, 'primary', exp)
+        log(f"Lease renewed, expires at {exp}")
+    except Exception as e:
+        log(f"Failed to renew lease: {e}", "ERROR")
+        return 'write-error'
+    return action
+
 def heartbeat_primary(cfg: Config, provider: DNSProvider):
     log(f"Starting PRIMARY heartbeat for {cfg.dns_record}")
     log(f"  Update interval: {cfg.update_interval}s, Lease TTL: {cfg.lease_ttl}s")
-    
-    # Initialize self-health checker if configured
+
     self_health_checker = None
     if cfg.health_url:
         log(f"  Self-health check enabled:")
@@ -1068,97 +1219,81 @@ def heartbeat_primary(cfg: Config, provider: DNSProvider):
         )
     else:
         log(f"  Self-health check: disabled (no HEALTH_URL)")
-    
+
     while True:
-        # Check own OTEL health before renewing
-        if self_health_checker:
-            local_healthy = self_health_checker.check()
-            if not local_healthy:
-                log("Local OTEL unhealthy - NOT renewing lease (will expire)", "WARN")
-                time.sleep(cfg.update_interval)
-                continue
-        
-        # Check current lease owner before renewing
         try:
-            records = provider.get_records()
-            txt_data = parse_txt(records.get('TXT'))
-            current_owner = txt_data.get('owner')
-            
-            if current_owner == 'dr':
-                log("DR currently owns lease - not overwriting (run 'failback' to reclaim)", "WARN")
-                time.sleep(cfg.update_interval)
-                continue
+            primary_tick(cfg, provider, self_health_checker)
         except Exception as e:
-            log(f"Failed to check lease owner: {e} - attempting renewal anyway", "WARN")
-        
-        # Renew lease
-        try:
-            exp = now_unix() + cfg.lease_ttl
-            provider.set_records(cfg.primary_ip, 'primary', exp)
-            log(f"Lease renewed, expires at {exp}")
-        except Exception as e:
-            log(f"Failed to renew lease: {e}", "ERROR")
+            log(f"Unexpected error in primary loop: {e}", "ERROR")
         time.sleep(cfg.update_interval)
+
+
+class DRState:
+    def __init__(self):
+        self.consecutive_failures = 0
+
+def dr_tick(cfg: Config, provider: DNSProvider, state: DRState, check_primary) -> str:
+    """One DR heartbeat iteration. `check_primary()` returns True if primary is healthy."""
+    if check_primary():
+        if state.consecutive_failures:
+            log("Primary healthy")
+        state.consecutive_failures = 0
+    else:
+        state.consecutive_failures += 1
+        log(f"Primary health check failed ({state.consecutive_failures}/{cfg.fail_threshold})", "WARN")
+    primary_failed = state.consecutive_failures >= cfg.fail_threshold
+
+    try:
+        lease = read_lease(provider)
+    except LeaseReadError as e:
+        # Never fail over on an unreadable lease: we can't prove primary's lease expired.
+        log(f"Cannot read lease ({e}) - not acting this cycle", "WARN")
+        return 'read-error'
+
+    now = now_unix()
+    action = decide_dr(lease, now, primary_failed)
+    try:
+        if action == 'renew':
+            provider.set_records(cfg.dr_ip, 'dr', now + cfg.lease_ttl)
+            log("DR lease renewed")
+        elif action == 'promote':
+            log("Primary lease expired - initiating failover!", "WARN")
+            promote_to_dr(cfg, provider)
+        elif action == 'wait':
+            log(f"Waiting for primary lease to expire ({lease.exp - now}s remaining)", "WARN")
+    except Exception as e:
+        log(f"DNS update failed during '{action}': {e}", "ERROR")
+        return 'write-error'
+    return action
 
 def heartbeat_dr(cfg: Config, provider: DNSProvider):
     log(f"Starting DR heartbeat for {cfg.dns_record}")
-    
-    # Initialize health checker based on mode
-    if cfg.health_mode == 'metrics':
-        if not cfg.health_url:
-            log("HEALTH_MODE=metrics but HEALTH_URL not set, falling back to tcp", "WARN")
-            cfg.health_mode = 'tcp'
-        else:
-            log(f"  Health mode: metrics")
-            log(f"  Metrics URL: {cfg.health_url}")
-            log(f"  Metric: {cfg.health_metric}")
-            log(f"  Stale threshold: {cfg.health_stale_count}")
-            metrics_checker = MetricsHealthChecker(
-                cfg.health_url,
-                cfg.health_metric,
-                cfg.health_stale_count,
-                cfg.health_timeout
-            )
-    
-    if cfg.health_mode == 'tcp':
+
+    if cfg.health_mode == 'metrics' and cfg.health_url:
+        log(f"  Health mode: metrics")
+        log(f"  Metrics URL: {cfg.health_url}")
+        log(f"  Metric: {cfg.health_metric}")
+        log(f"  Stale threshold: {cfg.health_stale_count}")
+        metrics_checker = MetricsHealthChecker(
+            cfg.health_url,
+            cfg.health_metric,
+            cfg.health_stale_count,
+            cfg.health_timeout
+        )
+        check_primary = metrics_checker.check
+    else:
         log(f"  Health mode: tcp")
         log(f"  Monitoring: {cfg.health_host}:{cfg.health_port}")
-    
+        check_primary = lambda: check_tcp(cfg.health_host, cfg.health_port, cfg.health_timeout)
+
     log(f"  Fail threshold: {cfg.fail_threshold}, Check interval: {cfg.update_interval}s")
-    
-    consecutive_failures = 0
+
+    state = DRState()
     while True:
-        # Perform health check based on mode
-        if cfg.health_mode == 'metrics':
-            primary_healthy = metrics_checker.check()
-        else:
-            primary_healthy = check_tcp(cfg.health_host, cfg.health_port, cfg.health_timeout)
-            if primary_healthy:
-                log("Primary healthy")
-        
-        if primary_healthy:
-            consecutive_failures = 0
-        else:
-            consecutive_failures += 1
-            if cfg.health_mode == 'tcp':
-                log(f"Primary health check failed ({consecutive_failures}/{cfg.fail_threshold})", "WARN")
-            # metrics mode logs its own messages
-            
-            if consecutive_failures >= cfg.fail_threshold:
-                records = provider.get_records()
-                txt_data = parse_txt(records.get('TXT'))
-                current_owner = txt_data.get('owner')
-                exp_unix = int(txt_data.get('exp', '0')) if txt_data.get('exp') else 0
-                if current_owner == 'dr':
-                    exp = now_unix() + cfg.lease_ttl
-                    provider.set_records(cfg.dr_ip, 'dr', exp)
-                    log("DR lease renewed")
-                elif exp_unix < now_unix():
-                    log("Primary lease expired - initiating failover!", "WARN")
-                    promote_to_dr(cfg, provider)
-                else:
-                    remaining = exp_unix - now_unix()
-                    log(f"Waiting for primary lease to expire ({remaining}s remaining)", "WARN")
+        try:
+            dr_tick(cfg, provider, state, check_primary)
+        except Exception as e:
+            log(f"Unexpected error in DR loop: {e}", "ERROR")
         time.sleep(cfg.update_interval)
 
 # -----------------------------

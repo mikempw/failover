@@ -150,6 +150,9 @@ failover.example.com.  30  IN  TXT  "owner=primary exp=1769571600"
 - Owner must renew before expiration
 - If lease expires, any node can claim ownership
 - DR will only claim if health check also fails (prevents split-brain during network partition)
+- Once DR owns the lease it keeps renewing it, even after primary recovers, until a manual `failback`
+- If DR owns the lease but stops renewing it (DR down), primary reclaims it once it expires
+- If the lease cannot be *read* (DNS SERVFAIL, timeout, API error, script failure), neither side acts that cycle: DR never fails over and primary never writes blind on an unreadable lease
 
 ---
 
@@ -839,8 +842,8 @@ dns-failover/
 ├── Dockerfile.otel-watcher-docker
 ├── requirements.txt             # Python dependencies
 ├── setup.py                     # Interactive configuration wizard
-├── .env.primary                 # Primary site config template
-├── .env.dr                      # DR site config template
+├── .env.primary.example         # Primary site config template (copy to .env.primary)
+├── .env.dr.example              # DR site config template (copy to .env.dr)
 ├── k8s/
 │   ├── dns-failover.yaml        # Kubernetes manifests
 │   └── otel-watcher.yaml

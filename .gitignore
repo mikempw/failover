@@ -1,0 +1,13 @@
+# Real configs and secrets (templates are *.example)
+failover/.env.primary
+failover/.env.dr
+failover/secrets/
+failover/state/
+.env
+.env.device-secrets
+services/otel_collector/receivers.yaml
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/

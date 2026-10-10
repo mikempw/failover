@@ -7,8 +7,8 @@
 #   - Grafana (dashboards)
 #   - dns-failover (monitors primary, takes over if failed)
 #   - otel-watcher (controls OTEL based on DNS)
-#   - ch-sync (replicates ClickHouse from Primary)
 #   - vm-sync (pulls from Primary to fill gaps)
+#   - ch-sync (pulls ClickHouse rows from Primary to fill gaps)
 #
 # Usage:
 #   docker compose -f docker-compose.dr.yaml up -d
@@ -78,6 +78,9 @@ services:
     env_file:
       - ".env"
       - ".env.device-secrets"
+    environment:
+      # The other site's VictoriaMetrics (dual-write target)
+      - PEER_VM_URL=http://192.168.100.144:8428/api/v1/write
     ports:
       - "8888:8888"
       - "4317:4317"
@@ -125,6 +128,7 @@ services:
       - ./failover/.env.dr
     volumes:
       - ./failover/state:/state
+      - ./failover/secrets:/secrets:ro
     networks:
       - ast_network
 
@@ -136,11 +140,12 @@ services:
     container_name: otel-watcher
     restart: unless-stopped
     network_mode: host
+    # Same env file as dns-failover so the record and site IPs can't disagree.
+    # MY_IP is derived from ROLE + PRIMARY_IP/DR_IP (set MY_IP to override).
+    env_file:
+      - ./failover/.env.dr
     environment:
-      - DNS_RECORD=failover.mpwlabs.com
-      - MY_IP=192.168.100.143
       - OTEL_CONTAINER=application-study-tool-otel-collector-1
-      - DNS_SERVER=8.8.8.8
       - OTEL_CHECK_INTERVAL=15
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -166,3 +171,27 @@ services:
       - ast_network
     depends_on:
       - victoriametrics
+
+  # ===================
+  # REPLICATION: ClickHouse Sync (append-only gap fill from the other site)
+  # ===================
+  ch-sync:
+    build:
+      context: ./ch-sync
+      dockerfile: Dockerfile
+    image: ch-sync
+    container_name: ch-sync
+    restart: unless-stopped
+    environment:
+      - SOURCE_HOST=192.168.100.144
+      - SOURCE_PORT=8123
+      - SOURCE_NATIVE_PORT=9000
+      - DEST_HOST=clickhouse
+      - DEST_PORT=8123
+      - SYNC_INTERVAL=300
+      - SYNC_LOOKBACK_HOURS=72
+      - SYNC_DATABASES=ast
+    networks:
+      - ast_network
+    depends_on:
+      - clickhouse
