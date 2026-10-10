@@ -3,9 +3,9 @@
 OTEL Collector Watcher for Docker
 
 Monitors the DNS failover record and starts/stops the OTEL collector container
-based on whether this site (DR) owns the DNS record.
+based on whether this site owns the DNS record.
 
-When DNS points to DR IP → docker start otel-collector
+When DNS points to this site's IP → docker start otel-collector
 When DNS points elsewhere → docker stop otel-collector
 
 This ensures only ONE site is collecting telemetry at a time.
@@ -30,8 +30,22 @@ from datetime import datetime
 # DNS record to watch (same as dns_failover uses)
 DNS_RECORD = os.getenv('DNS_RECORD', 'syslog.ast.example.local')
 
-# This site's IP - when DNS points here, we're active
-MY_IP = os.getenv('DR_IP', os.getenv('MY_IP'))
+def resolve_my_ip(env=os.environ):
+    """
+    This site's IP - when DNS points here, we're active.
+    MY_IP wins if set; otherwise derived from ROLE + PRIMARY_IP/DR_IP so the
+    watcher can share the dns-failover env file and never disagree with it.
+    """
+    if env.get('MY_IP'):
+        return env['MY_IP']
+    role = env.get('ROLE', '').lower()
+    if role == 'primary':
+        return env.get('PRIMARY_IP')
+    if role == 'dr':
+        return env.get('DR_IP')
+    return None
+
+MY_IP = resolve_my_ip()
 
 # How often to check DNS (seconds)
 CHECK_INTERVAL = int(os.getenv('OTEL_CHECK_INTERVAL', '15'))
@@ -162,12 +176,12 @@ def main():
     
     # Validate config
     if not MY_IP:
-        log("ERROR: MY_IP or DR_IP environment variable must be set", "ERROR")
-        log("This should be the IP address of THIS site (DR)")
+        log("ERROR: set MY_IP, or ROLE plus PRIMARY_IP/DR_IP", "ERROR")
+        log("This should be the IP address of THIS site")
         sys.exit(1)
     
     log(f"DNS Record:      {DNS_RECORD}")
-    log(f"My IP (DR):      {MY_IP}")
+    log(f"My IP:           {MY_IP}")
     log(f"Check Interval:  {CHECK_INTERVAL}s")
     log(f"OTEL Container:  {OTEL_CONTAINER}")
     if DNS_SERVER:

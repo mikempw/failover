@@ -9,8 +9,8 @@ metrics:
   processors:
     - batch/local
   exporters:
-    - prometheusremotewrite/primary   # → Primary VictoriaMetrics
-    - prometheusremotewrite/dr        # → DR VictoriaMetrics
+    - prometheusremotewrite/local     # → this site's VictoriaMetrics
+    - prometheusremotewrite/peer      # → other site's VictoriaMetrics (PEER_VM_URL)
     - clickhouse                      # → ClickHouse (synced via ch-sync)
 
 metrics/f5-datafabric:

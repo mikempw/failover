@@ -1,8 +1,9 @@
 # bigip-scraper-config.yaml
 #
 # OTEL Collector config for dual-site metrics delivery
-# Pushes metrics to BOTH Primary and DR VictoriaMetrics instances
-# This ensures DR always has up-to-date metrics for instant failover
+# Pushes metrics to BOTH the local and the peer site's VictoriaMetrics.
+# Same file at both sites; the peer is set per site via PEER_VM_URL
+# (docker-compose.<site>.yaml), so whichever site is active writes to both.
 #
 # Place in: services/otel_collector/defaults/bigip-scraper-config.yaml
 
@@ -27,9 +28,9 @@ processors:
 
 exporters:
   # ===================
-  # Primary VictoriaMetrics (local)
+  # Local VictoriaMetrics (this site)
   # ===================
-  prometheusremotewrite/primary:
+  prometheusremotewrite/local:
     endpoint: http://victoriametrics:8428/api/v1/write
     tls:
       insecure: true
@@ -42,10 +43,10 @@ exporters:
       max_elapsed_time: 300s
 
   # ===================
-  # DR VictoriaMetrics (remote)
+  # Peer VictoriaMetrics (the other site)
   # ===================
-  prometheusremotewrite/dr:
-    endpoint: http://192.168.100.143:8428/api/v1/write
+  prometheusremotewrite/peer:
+    endpoint: ${env:PEER_VM_URL}
     tls:
       insecure: true
     resource_to_telemetry_conversion:

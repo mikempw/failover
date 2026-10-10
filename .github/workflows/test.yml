@@ -1,0 +1,28 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    env:
+      CLICKHOUSE_VERSION: 24.8.14.39
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Install ClickHouse (for ch-sync integration tests)
+        run: |
+          curl -fsSL -o ch.tgz "https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}-lts/clickhouse-common-static-${CLICKHOUSE_VERSION}-amd64.tgz"
+          tar xzf ch.tgz
+          echo "CLICKHOUSE_BIN=$PWD/clickhouse-common-static-${CLICKHOUSE_VERSION}/usr/bin/clickhouse" >> "$GITHUB_ENV"
+      - name: Run tests
+        run: pytest -q -rs

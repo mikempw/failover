@@ -797,7 +797,7 @@ def main():
     print_info("DR site will check this endpoint to determine if Primary is healthy")
     
     config['HEALTH_HOST'] = ask("Health check host", default=config['PRIMARY_IP'])
-    config['HEALTH_PORT'] = ask("Health check port", default="6514")
+    config['HEALTH_PORT'] = ask("Health check port (primary OTEL collector telemetry)", default="8888")
     config['HEALTH_TIMEOUT'] = ask("Health check timeout (seconds)", default="2")
     
     # Step 6: Vault integration (optional)
