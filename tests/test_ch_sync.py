@@ -41,7 +41,8 @@ def make_syncer(**over):
 
 
 def test_fill_query_is_append_only_and_deduplicated():
-    q = make_syncer().build_fill_query('ast', 'otel_logs', ['Timestamp', 'Body'], 'Timestamp', 3600)
+    types = {'Timestamp': 'DateTime64(9)', 'Body': 'String'}
+    q = make_syncer().build_fill_query('ast', 'otel_logs', ['Timestamp', 'Body'], types, 'Timestamp', 3600)
     assert q.startswith('INSERT INTO `ast`.`otel_logs` (`Timestamp`, `Body`)')
     assert 'DROP' not in q.upper()
     # GLOBAL is required: a plain NOT IN would be evaluated on the remote side
@@ -49,6 +50,12 @@ def test_fill_query_is_append_only_and_deduplicated():
     assert 'GLOBAL NOT IN' in q
     assert "remote('10.0.0.1:9000', 'ast', 'otel_logs', 'default', 'pa\\'ss')" in q
     assert 'toDateTime(3600)' in q and 'toDateTime(7200)' in q
+
+
+def test_row_hash_handles_nullable_and_casts_to_dest_type():
+    h = cs.Syncer.row_hash(['a', 'b'], {'a': 'Nullable(String)', 'b': 'DateTime64(6)'})
+    assert h == ("cityHash64(isNull(CAST(`a`, 'Nullable(String)')), assumeNotNull(CAST(`a`, 'Nullable(String)')), "
+                 "CAST(`b`, 'DateTime64(6)'))")
 
 
 def test_from_env_defaults():
@@ -287,3 +294,34 @@ def test_partial_bucket_filled(fresh):
     syncer(p, d, fresh['src_tcp']).run_once()
     assert count(d, 'otel_metrics_gauge') == 5
     assert distinct_rows(d, 'otel_metrics_gauge') == 5
+
+
+def test_rows_with_nulls_are_synced(fresh):
+    """Regression: cityHash64(NULL, ...) is NULL, so such rows were never copied."""
+    p, d = fresh['src'], fresh['dst']
+    ddl = ("CREATE TABLE ast.n (Timestamp DateTime64(9), Body Nullable(String), Sev LowCardinality(Nullable(String))) "
+           "ENGINE = MergeTree ORDER BY Timestamp")
+    for ep in (p, d):
+        ep.execute(ddl)
+    t = NOW - 2 * HOUR
+    p.execute(f"INSERT INTO ast.n VALUES (toDateTime64({t}, 9), NULL, NULL), (toDateTime64({t + 1}, 9), 'x', 'INFO'), "
+              f"(toDateTime64({t + 2}, 9), '', '')")
+    s = syncer(p, d, fresh['src_tcp'])
+    s.run_once()
+    assert count(d, 'n') == 3
+    assert count(d, 'n', 'Body IS NULL') == 1 and count(d, 'n', "Body = ''") == 1   # NULL kept distinct from ''
+    assert s.sync_table('ast', 'n') == 0   # converged
+
+
+def test_type_drift_between_sites_does_not_duplicate(fresh):
+    """Regression: hashing on each side's own type made equal rows look different every pass."""
+    p, d = fresh['src'], fresh['dst']
+    p.execute("CREATE TABLE ast.t (Timestamp DateTime64(9), v UInt32) ENGINE = MergeTree ORDER BY Timestamp")
+    d.execute("CREATE TABLE ast.t (Timestamp DateTime64(6), v UInt64) ENGINE = MergeTree ORDER BY Timestamp")
+    t = NOW - 2 * HOUR
+    p.execute(f"INSERT INTO ast.t VALUES (toDateTime64({t}, 9), 1), (toDateTime64({t + 1}, 9), 2)")
+    s = syncer(p, d, fresh['src_tcp'])
+    for _ in range(3):
+        s.run_once()
+    assert count(d, 't') == 2
+    assert s.sync_table('ast', 't') == 0

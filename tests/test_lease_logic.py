@@ -38,6 +38,12 @@ def test_decide_dr(owner, exp, failed, expected):
     assert df.decide_dr(df.Lease('1.1.1.1', owner, exp), NOW, failed) == expected
 
 
+def test_decide_primary_reclaim_grace_tolerates_clock_skew():
+    lease = df.Lease('1.1.1.1', 'dr', NOW - 30)
+    assert df.decide_primary(lease, NOW, reclaim_grace=60) == 'yield'
+    assert df.decide_primary(lease, NOW + 31, reclaim_grace=60) == 'reclaim'
+
+
 # ---- read_lease ----
 
 def test_read_lease_parses_txt():
@@ -133,9 +139,82 @@ def test_primary_yields_to_live_dr_lease():
 
 
 def test_primary_reclaims_expired_dr_lease():
-    p = FakeProvider(ip='10.20.20.10', owner='dr', exp=NOW - 1)
+    p = FakeProvider(ip='10.20.20.10', owner='dr', exp=NOW - 61)   # beyond LEASE_TTL grace
     assert df.primary_tick(make_cfg(), p, None) == 'reclaim'
     assert p.writes[-1][:2] == ('10.10.10.10', 'primary')
+
+
+def test_primary_does_not_reclaim_within_grace():
+    p = FakeProvider(ip='10.20.20.10', owner='dr', exp=NOW - 30)
+    assert df.primary_tick(make_cfg(), p, None) == 'yield'
+
+
+class FailingChecker:
+    """Like a MetricsHealthChecker whose collector is stopped."""
+    def __init__(self):
+        self.resets = 0
+        self.checks = 0
+
+    def check(self):
+        self.checks += 1
+        return False
+
+    def reset(self):
+        self.resets += 1
+
+
+def test_primary_reclaims_even_though_local_collector_is_stopped():
+    """Regression: with HEALTH_URL set, the stopped collector blocked reclaim forever."""
+    p = FakeProvider(ip='10.20.20.10', owner='dr', exp=NOW - 61)
+    chk = FailingChecker()
+    assert df.primary_tick(make_cfg(), p, chk) == 'reclaim'
+    assert chk.resets == 1 and chk.checks == 0
+    assert p.writes[-1][:2] == ('10.10.10.10', 'primary')
+
+
+def test_primary_yield_does_not_run_self_check():
+    p = FakeProvider(ip='10.20.20.10', owner='dr', exp=NOW + 30)
+    chk = FailingChecker()
+    assert df.primary_tick(make_cfg(), p, chk) == 'yield'
+    assert chk.checks == 0
+
+
+def test_read_lease_rejects_non_string_txt():
+    p = FakeProvider()
+    p.records = {'A': '1.2.3.4', 'TXT': ['owner=dr', 'exp=1']}
+    with pytest.raises(df.LeaseReadError):
+        df.read_lease(p)
+
+
+class RacingProvider(FakeProvider):
+    """DR's in-flight renewal lands right after the first failback write."""
+    def __init__(self):
+        super().__init__(ip='10.20.20.10', owner='dr', exp=NOW + 30)
+        self.raced = False
+
+    def set_records(self, ip, owner, exp_unix):
+        super().set_records(ip, owner, exp_unix)
+        if owner == 'primary' and not self.raced:
+            self.raced = True
+            super().set_records('10.20.20.10', 'dr', exp_unix)
+
+
+def test_failback_detects_and_retries_overwrite(monkeypatch):
+    monkeypatch.setattr(df.time, 'sleep', lambda s: None)
+    p = RacingProvider()
+    assert df.failback_to_primary(make_cfg(), p) is True
+    assert df.read_lease(p).owner == 'primary'
+    assert [w[1] for w in p.writes] == ['primary', 'dr', 'primary']
+
+
+def test_failback_reports_failure(monkeypatch):
+    monkeypatch.setattr(df.time, 'sleep', lambda s: None)
+
+    class AlwaysDR(FakeProvider):
+        def set_records(self, ip, owner, exp_unix):
+            super().set_records('10.20.20.10', 'dr', exp_unix)
+
+    assert df.failback_to_primary(make_cfg(), AlwaysDR(), attempts=2) is False
 
 
 def test_primary_does_not_write_blind_on_read_error():
@@ -179,6 +258,6 @@ def test_full_failover_and_failback_cycle(tmp_path, monkeypatch):
     assert df.primary_tick(pcfg, prov, None) == 'yield'
 
     # Manual failback; DR then goes idle.
-    df.failback_to_primary(pcfg, prov)
+    assert df.failback_to_primary(pcfg, prov, verify_delay=0)
     assert df.dr_tick(dcfg, prov, dstate, lambda: True) == 'idle'
     assert df.read_lease(prov).owner == 'primary'

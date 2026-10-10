@@ -151,7 +151,7 @@ failover.example.com.  30  IN  TXT  "owner=primary exp=1769571600"
 - If lease expires, any node can claim ownership
 - DR will only claim if health check also fails (prevents split-brain during network partition)
 - Once DR owns the lease it keeps renewing it, even after primary recovers, until a manual `failback`
-- If DR owns the lease but stops renewing it (DR down), primary reclaims it once it expires
+- If DR owns the lease but stops renewing it (DR down), primary reclaims it once it has been expired for more than `LEASE_TTL` (clock-skew grace)
 - If the lease cannot be *read* (DNS SERVFAIL, timeout, API error, script failure), neither side acts that cycle: DR never fails over and primary never writes blind on an unreadable lease
 
 ---

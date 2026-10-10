@@ -26,6 +26,13 @@ Environment Variables:
                        (default: TimeUnix,Timestamp)
   INSERT_TIMEOUT       seconds per bucket insert (default 1800)
 
+Limitations:
+  * Materialized views are not synced and their target tables are treated
+    like any other table. If an MV target has a time column, syncing both the
+    MV source and target can double-count (the MV fires on DEST inserts).
+    The default OTel exporter schema is not affected.
+  * Exact duplicate rows within one hour on SOURCE are copied once.
+
 Usage:
   python3 ch_sync.py          # loop forever
   python3 ch_sync.py --once   # single pass (manual recovery)
@@ -147,14 +154,14 @@ class Syncer:
         )
         return [r['name'] for r in rows]
 
-    def columns(self, ep: CHEndpoint, database: str, table: str) -> List[str]:
-        """Physical (insertable) columns in table order."""
+    def columns(self, ep: CHEndpoint, database: str, table: str) -> List[tuple]:
+        """Physical (insertable) columns in table order, as (name, type)."""
         rows = ep.query(
-            f"SELECT name FROM system.columns WHERE database = {quote_str(database)} "
+            f"SELECT name, type FROM system.columns WHERE database = {quote_str(database)} "
             f"AND table = {quote_str(table)} AND default_kind NOT IN ('MATERIALIZED', 'ALIAS', 'EPHEMERAL') "
             f"ORDER BY position"
         )
-        return [r['name'] for r in rows]
+        return [(r['name'], r['type']) for r in rows]
 
     def sync_schema(self, database: str):
         self.dst.execute(f"CREATE DATABASE IF NOT EXISTS {quote_ident(database)}")
@@ -170,15 +177,36 @@ class Syncer:
 
     # --- per-table reconciliation ---
 
+    @staticmethod
+    def row_hash(cols: List[str], types: Dict[str, str]) -> str:
+        """
+        Row content hash, identical on both sides:
+          * every column is CAST to the DEST type first, so a type difference
+            between sites (e.g. DateTime64(9) vs (6)) can't make equal rows
+            hash differently and get re-inserted forever;
+          * Nullable columns are hashed as (isNull, assumeNotNull) because
+            cityHash64 returns NULL if any argument is NULL.
+        """
+        parts = []
+        for c in cols:
+            t = types[c]
+            x = f"CAST({quote_ident(c)}, {quote_str(t)})"
+            if t.startswith('Nullable(') or t.startswith('LowCardinality(Nullable('):
+                parts += [f"isNull({x})", f"assumeNotNull({x})"]
+            else:
+                parts.append(x)
+        return f"cityHash64({', '.join(parts)})"
+
     def bucket_fingerprints(self, ep: CHEndpoint, database: str, table: str, cols: List[str],
-                            time_col: str, since: int, until: Optional[int] = None) -> Dict[int, tuple]:
+                            types: Dict[str, str], time_col: str, since: int,
+                            until: Optional[int] = None) -> Dict[int, tuple]:
         """
         Per-hour (row count, order-independent content hash) for rows with time >= since.
         Count alone is not enough: around a failover both sites can hold the same
         number of *different* rows for one hour.
         """
         tc = quote_ident(time_col)
-        row_hash = f"cityHash64({', '.join(quote_ident(c) for c in cols)})"
+        row_hash = self.row_hash(cols, types)
         where = f"{tc} >= toDateTime({since})"
         if until is not None:
             where += f" AND {tc} < toDateTime({until})"
@@ -197,11 +225,12 @@ class Syncer:
             f"{quote_str(self.src.user)}, {quote_str(self.src.password)})"
         )
 
-    def build_fill_query(self, database: str, table: str, cols: List[str], time_col: str, bucket: int) -> str:
+    def build_fill_query(self, database: str, table: str, cols: List[str], types: Dict[str, str],
+                         time_col: str, bucket: int) -> str:
         col_list = ', '.join(quote_ident(c) for c in cols)
         tc = quote_ident(time_col)
         window = f"{tc} >= toDateTime({bucket}) AND {tc} < toDateTime({bucket + 3600})"
-        row_hash = f"cityHash64({col_list})"
+        row_hash = self.row_hash(cols, types)
         return (
             f"INSERT INTO {quote_ident(database)}.{quote_ident(table)} ({col_list}) "
             f"SELECT {col_list} FROM {self.source_table_expr(database, table)} "
@@ -211,9 +240,9 @@ class Syncer:
 
     def sync_table(self, database: str, table: str, now: Optional[int] = None) -> int:
         """Returns the number of buckets that were reconciled."""
-        src_cols = self.columns(self.src, database, table)
-        dst_cols = set(self.columns(self.dst, database, table))
-        cols = [c for c in src_cols if c in dst_cols]
+        src_cols = [n for n, _ in self.columns(self.src, database, table)]
+        types = dict(self.columns(self.dst, database, table))
+        cols = [c for c in src_cols if c in types]
         if len(cols) != len(src_cols):
             log(f"  {database}.{table}: schema differs; syncing {len(cols)}/{len(src_cols)} shared columns", "WARN")
 
@@ -224,8 +253,8 @@ class Syncer:
 
         now = int(time.time()) if now is None else now
         since = (now - self.cfg.lookback_hours * 3600) // 3600 * 3600
-        src_buckets = self.bucket_fingerprints(self.src, database, table, cols, time_col, since)
-        dst_buckets = self.bucket_fingerprints(self.dst, database, table, cols, time_col, since)
+        src_buckets = self.bucket_fingerprints(self.src, database, table, cols, types, time_col, since)
+        dst_buckets = self.bucket_fingerprints(self.dst, database, table, cols, types, time_col, since)
 
         reconciled = 0
         for bucket in sorted(src_buckets):
@@ -233,9 +262,9 @@ class Syncer:
                 continue
             src_n = src_buckets[bucket][0]
             before = dst_buckets.get(bucket, (0, ''))[0]
-            self.dst.execute(self.build_fill_query(database, table, cols, time_col, bucket),
+            self.dst.execute(self.build_fill_query(database, table, cols, types, time_col, bucket),
                              timeout=self.cfg.insert_timeout)
-            after = self.bucket_fingerprints(self.dst, database, table, cols, time_col,
+            after = self.bucket_fingerprints(self.dst, database, table, cols, types, time_col,
                                              bucket, bucket + 3600).get(bucket, (0, ''))[0]
             hour = datetime.fromtimestamp(bucket, timezone.utc).strftime('%Y-%m-%d %H:00Z')
             log(f"    {table} {hour}: src={src_n} dst={before} -> inserted {after - before}")

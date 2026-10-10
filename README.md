@@ -142,8 +142,11 @@ docker exec dns-failover python3 /app/dns_failover.py show
 docker exec dns-failover python3 /app/dns_failover.py failback
 ```
 
-DR keeps the lease after a failover until this is run. If DR goes down while
-holding it, primary reclaims the lease once it expires.
+DR keeps the lease after a failover until this is run. `failback` re-reads the
+lease after one DR interval and retries if an in-flight DR renewal overwrote
+it; it exits non-zero if it can't confirm. If DR goes down while holding the
+lease, primary reclaims it once it has been expired for a further `LEASE_TTL`
+(grace for clock skew between sites).
 
 ### Manual ClickHouse catch-up
 ```bash

@@ -226,7 +226,7 @@ class Config:
             update_interval=get_int('UPDATE_INTERVAL', 10),
             fail_threshold=get_int('FAIL_THRESHOLD', 3),
             health_host=get('HEALTH_HOST', '10.10.10.10'),
-            health_port=get_int('HEALTH_PORT', 6514),
+            health_port=get_int('HEALTH_PORT', 8888),
             health_timeout=get_int('HEALTH_TIMEOUT', 2),
             health_mode=get('HEALTH_MODE', 'tcp'),
             health_url=get('HEALTH_URL'),
@@ -484,6 +484,11 @@ class MetricsHealthChecker:
         self.stale_count = stale_count
         self.timeout = timeout
         self.last_value: Optional[float] = None
+        self.stale_checks = 0
+    
+    def reset(self):
+        """Forget history (e.g. after the local collector was intentionally stopped)."""
+        self.last_value = None
         self.stale_checks = 0
     
     def check(self) -> bool:
@@ -1110,6 +1115,11 @@ def read_lease(provider: DNSProvider) -> Lease:
         raise
     except Exception as e:
         raise LeaseReadError(str(e)) from e
+    if not isinstance(records, dict):
+        raise LeaseReadError(f"provider returned {type(records).__name__}, expected dict")
+    for key in ('A', 'TXT'):
+        if records.get(key) is not None and not isinstance(records.get(key), str):
+            raise LeaseReadError(f"provider returned non-string {key}: {records.get(key)!r}")
     txt = parse_txt(records.get('TXT'))
     try:
         exp = int(txt.get('exp') or 0)
@@ -1120,15 +1130,17 @@ def read_lease(provider: DNSProvider) -> Lease:
 
 # Decisions are pure functions so they can be unit-tested without timing loops.
 
-def decide_primary(lease: Lease, now: int) -> str:
+def decide_primary(lease: Lease, now: int, reclaim_grace: int = 0) -> str:
     """
-    Primary heartbeat decision (only called when primary considers itself healthy).
+    Primary heartbeat decision.
       'renew'   - write primary lease
       'yield'   - DR holds a live lease; leave it (manual 'failback' reclaims)
-      'reclaim' - DR owns the lease but stopped renewing it (DR is down); take it back
+      'reclaim' - DR owns the lease but stopped renewing it (DR is down); take it back.
+                  Requires the lease to be expired by more than `reclaim_grace`
+                  seconds so modest clock skew between sites can't cause flapping.
     """
     if lease.owner == 'dr':
-        return 'yield' if lease.exp >= now else 'reclaim'
+        return 'reclaim' if lease.exp + reclaim_grace < now else 'yield'
     return 'renew'
 
 def decide_dr(lease: Lease, now: int, primary_failed: bool) -> str:
@@ -1158,10 +1170,28 @@ def promote_to_dr(cfg: Config, provider: DNSProvider):
     provider.set_records(cfg.dr_ip, 'dr', exp)
     log(f"FAILOVER: Promoted DR to active, A={cfg.dr_ip}")
 
-def failback_to_primary(cfg: Config, provider: DNSProvider):
-    exp = now_unix() + cfg.lease_ttl
-    provider.set_records(cfg.primary_ip, 'primary', exp)
-    log(f"FAILBACK: Restored primary as active, A={cfg.primary_ip}")
+def failback_to_primary(cfg: Config, provider: DNSProvider, verify_delay: Optional[float] = None, attempts: int = 3) -> bool:
+    """
+    Write the primary lease, then re-read after one DR interval to confirm a DR
+    renewal that was in flight didn't overwrite it. Retries; returns success.
+    """
+    delay = cfg.update_interval + 2 if verify_delay is None else verify_delay
+    for attempt in range(1, attempts + 1):
+        exp = now_unix() + cfg.lease_ttl
+        provider.set_records(cfg.primary_ip, 'primary', exp)
+        log(f"FAILBACK: wrote primary lease (attempt {attempt}), verifying in {delay:.0f}s")
+        time.sleep(delay)
+        try:
+            lease = read_lease(provider)
+        except LeaseReadError as e:
+            log(f"FAILBACK: cannot verify ({e})", "WARN")
+            continue
+        if lease.owner == 'primary' and lease.ip == cfg.primary_ip:
+            log(f"FAILBACK: Restored primary as active, A={cfg.primary_ip}")
+            return True
+        log(f"FAILBACK: lease overwritten (owner={lease.owner}), retrying", "WARN")
+    log("FAILBACK: could not confirm primary owns the lease", "ERROR")
+    return False
 
 def show_dns(cfg: Config, provider: DNSProvider):
     lease = read_lease(provider)
@@ -1174,24 +1204,28 @@ def show_dns(cfg: Config, provider: DNSProvider):
 
 def primary_tick(cfg: Config, provider: DNSProvider, self_health_checker: Optional['MetricsHealthChecker']) -> str:
     """One primary heartbeat iteration. Returns the action taken (for logging/tests)."""
-    if self_health_checker and not self_health_checker.check():
-        log("Local OTEL unhealthy - NOT renewing lease (will expire)", "WARN")
-        return 'unhealthy'
-
     try:
         lease = read_lease(provider)
     except LeaseReadError as e:
         # Don't write blind: if DR holds the lease we'd overwrite it and flap.
         log(f"Cannot read lease ({e}) - skipping renewal this cycle", "WARN")
         return 'read-error'
-
-    action = decide_primary(lease, now_unix())
+    
+    action = decide_primary(lease, now_unix(), reclaim_grace=cfg.lease_ttl)
     if action == 'yield':
         log("DR currently owns lease - not overwriting (run 'failback' to reclaim)", "WARN")
         return action
+    
     if action == 'reclaim':
+        # Our collector is stopped while DR is active (the watcher follows DNS),
+        # so the self-check can't pass yet. Reclaim, and start its history fresh.
         log(f"DR lease expired at {lease.exp} (DR stopped renewing) - reclaiming", "WARN")
-
+        if self_health_checker:
+            self_health_checker.reset()
+    elif self_health_checker and not self_health_checker.check():
+        log("Local OTEL unhealthy - NOT renewing lease (will expire)", "WARN")
+        return 'unhealthy'
+    
     try:
         exp = now_unix() + cfg.lease_ttl
         provider.set_records(cfg.primary_ip, 'primary', exp)
@@ -1325,7 +1359,8 @@ def main():
     elif args.command == 'promote':
         promote_to_dr(cfg, provider)
     elif args.command == 'failback':
-        failback_to_primary(cfg, provider)
+        if not failback_to_primary(cfg, provider):
+            sys.exit(1)
     elif args.command == 'show':
         show_dns(cfg, provider)
     elif args.command == 'run':
