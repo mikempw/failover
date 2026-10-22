@@ -119,6 +119,7 @@ services:
       CLICKHOUSE_ENDPOINT: tcp://clickhouse:9000
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-ast}
       CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-ast}
+      CLICKHOUSE_PASSWORD_FILE: /run/secrets/clickhouse_password
       LOCAL_VM_WRITE_URL: http://victoriametrics:8428/api/v1/write
       PEER_VM_WRITE_URL: ${DR_VM_WRITE_URL:-http://192.0.2.20:8428/api/v1/write}
     secrets:

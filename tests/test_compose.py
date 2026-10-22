@@ -361,6 +361,10 @@ class ComposePolicyTests(unittest.TestCase):
             )
             self.assertTrue(receiver_mount["read_only"])
             collector_env = services["otel-collector"]["environment"]
+            self.assertEqual(
+                collector_env["CLICKHOUSE_PASSWORD_FILE"],
+                "/run/secrets/clickhouse_password",
+            )
             self.assertNotIn("SENSOR_SECRET_TOKEN", collector_env)
             self.assertNotIn("BIGIP_PASSWORD_EXAMPLE", collector_env)
 
