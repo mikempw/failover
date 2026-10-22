@@ -126,6 +126,8 @@ class ComposePolicyTests(unittest.TestCase):
         gate = (ROOT / "services/otel_collector/bootstrap-gate.sh").read_text(
             encoding="utf-8"
         )
+        self.assertIn("USER 0:0", dockerfile)
+        self.assertNotIn("USER root", dockerfile)
         self.assertIn('ENTRYPOINT ["/bin/busybox", "sh", "/otel-bootstrap-gate.sh"]', dockerfile)
         self.assertIn('address_count" -eq 1', gate)
         self.assertIn('addresses" = "$expected_ip', gate)

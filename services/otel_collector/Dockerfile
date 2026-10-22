@@ -15,6 +15,6 @@ COPY --from=probe /bin/busybox /bin/busybox
 COPY --from=privilege-helper /drop-privileges /usr/local/bin/drop-privileges
 COPY services/otel_collector/bootstrap-gate.sh /otel-bootstrap-gate.sh
 
-USER root
+USER 0:0
 
 ENTRYPOINT ["/bin/busybox", "sh", "/otel-bootstrap-gate.sh"]
