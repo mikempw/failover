@@ -162,6 +162,10 @@ class ComposePolicyTests(unittest.TestCase):
         for config in self.configs.values():
             services = config["services"]
             clickhouse = services["clickhouse"]
+            self.assertEqual(
+                clickhouse["image"],
+                "clickhouse/clickhouse-server:24.3.18.7",
+            )
             self.assertEqual(clickhouse["environment"]["CLICKHOUSE_USER"], "ast")
             self.assertEqual(
                 clickhouse["environment"]["CLICKHOUSE_SKIP_USER_SETUP"], "1"

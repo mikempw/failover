@@ -71,6 +71,24 @@ jobs:
           docker compose -f docker-compose.primary.yaml up -d --wait
           --wait-timeout 240 clickhouse grafana
 
+      - name: Verify initialized ClickHouse database
+        run: |
+          docker compose -f docker-compose.primary.yaml exec -T clickhouse \
+            /bin/bash -ec '
+              result="$(clickhouse-client \
+                --user "$CLICKHOUSE_USER" \
+                --password "$(<"$CLICKHOUSE_PASSWORD_FILE")" \
+                --param_database "$CLICKHOUSE_DB" \
+                --query "SELECT count() FROM system.databases WHERE name = {database:String}")"
+              test "$result" = "1"
+            '
+
+      - name: Show smoke-test service diagnostics
+        if: failure()
+        run: |
+          docker compose -f docker-compose.primary.yaml ps -a
+          docker compose -f docker-compose.primary.yaml logs --no-color clickhouse grafana
+
       - name: Clean up smoke-test containers and volumes
         if: always()
         run: >-
