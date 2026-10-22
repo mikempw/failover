@@ -1,7 +1,14 @@
 #!/bin/sh
 set -eu
 
-compose_file="${1:-docker-compose.primary.yaml}"
+if [ "$#" -eq 0 ]; then
+    set -- -f docker-compose.primary.yaml
+elif [ "$1" != "-f" ]; then
+    compose_file=$1
+    shift
+    set -- -f "$compose_file" "$@"
+fi
+compose_description="$*"
 project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_root"
 
@@ -23,10 +30,10 @@ if [ "$docker_arch" != "amd64" ]; then
     exit 1
 fi
 
-docker compose -f "$compose_file" config --quiet
+docker compose "$@" config --quiet
 rendered_config=$(mktemp)
 trap 'rm -f "$rendered_config"' EXIT HUP INT TERM
-docker compose -f "$compose_file" config --format json > "$rendered_config"
+docker compose "$@" config --format json > "$rendered_config"
 
 # Validate the paths Compose actually rendered after applying .env and shell
 # overrides.  Parsing the JSON model avoids sourcing an arbitrary dotenv file
@@ -56,6 +63,47 @@ for secret_name, secret in sorted(model.get("secrets", {}).items()):
 
 collector = model.get("services", {}).get("otel-collector", {})
 collector_volumes = collector.get("volumes", [])
+replication_mode = collector.get("environment", {}).get(
+    "DATA_REPLICATION_MODE", "builtin"
+)
+if replication_mode not in {"builtin", "external"}:
+    errors.append(
+        "DATA_REPLICATION_MODE must be either 'builtin' or 'external'"
+    )
+elif replication_mode == "external":
+    services = model.get("services", {})
+    unexpected_sync = sorted({"vm-sync", "ch-sync"}.intersection(services))
+    if unexpected_sync:
+        errors.append(
+            "External-replication mode must disable built-in sync services: "
+            + ", ".join(unexpected_sync)
+        )
+
+    pipeline_sources = [
+        pathlib.Path(volume["source"])
+        for volume in collector_volumes
+        if isinstance(volume, dict)
+        and volume.get("target") == "/etc/otel-collector-config/pipelines.yaml"
+        and volume.get("source")
+    ]
+    if len(pipeline_sources) != 1:
+        errors.append(
+            "External-replication mode must bind exactly one local-only "
+            "collector pipeline"
+        )
+    else:
+        try:
+            pipeline_text = pipeline_sources[0].read_text(encoding="utf-8")
+        except OSError:
+            errors.append(
+                f"Missing local-only collector pipeline: {pipeline_sources[0]}"
+            )
+        else:
+            if "prometheusremotewrite/peer" in pipeline_text:
+                errors.append(
+                    "External-replication collector pipeline still enables "
+                    "peer remote write"
+                )
 receiver_sources = [
     pathlib.Path(volume["source"])
     for volume in collector_volumes
@@ -99,4 +147,4 @@ if errors:
     raise SystemExit(1)
 PY
 
-echo "Preflight passed for $compose_file"
+echo "Preflight passed for $compose_description"

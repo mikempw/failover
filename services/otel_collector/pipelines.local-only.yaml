@@ -1,0 +1,36 @@
+# External-replication mode keeps ingestion local. The external replication
+# system, not this collector, is responsible for copying stored data.
+metrics:
+  receivers:
+    - bigip
+  processors:
+    - batch/local
+  exporters:
+    - prometheusremotewrite/local
+    - clickhouse
+
+metrics/f5-datafabric:
+  receivers:
+    - bigip
+  processors:
+    - batch/f5-datafabric
+    - interval/f5-datafabric
+    - attributes/f5-datafabric
+  exporters:
+    - otlp/f5-datafabric
+
+logs:
+  receivers:
+    - otlp
+  processors:
+    - batch/local
+  exporters:
+    - clickhouse
+
+traces:
+  receivers:
+    - otlp
+  processors:
+    - batch/local
+  exporters:
+    - clickhouse

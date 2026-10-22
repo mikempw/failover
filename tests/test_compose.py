@@ -16,6 +16,10 @@ COMPOSE_FILES = {
     "primary": ROOT / "docker-compose.primary.yaml",
     "dr": ROOT / "docker-compose.dr.yaml",
 }
+EXTERNAL_OVERLAYS = {
+    "primary": ROOT / "docker-compose.external.primary.yaml",
+    "dr": ROOT / "docker-compose.external.dr.yaml",
+}
 
 
 class ComposePolicyTests(unittest.TestCase):
@@ -36,6 +40,20 @@ class ComposePolicyTests(unittest.TestCase):
             (secret_dir / name).write_text(
                 f"ci-only-{name}-4f6da376dd73416b", encoding="utf-8"
             )
+
+        cls._unsafe_external_override = secret_dir / "unsafe-external-override.yaml"
+        cls._unsafe_external_override.write_text(
+            """services:
+  otel-collector:
+    environment:
+      DATA_REPLICATION_MODE: builtin
+  vm-sync:
+    profiles: []
+  ch-sync:
+    profiles: []
+""",
+            encoding="utf-8",
+        )
 
         env = os.environ.copy()
         env.update(
@@ -58,6 +76,32 @@ class ComposePolicyTests(unittest.TestCase):
             site: cls._render(docker, compose_file, env)
             for site, compose_file in COMPOSE_FILES.items()
         }
+        cls.external_configs = {
+            site: cls._render(
+                docker, (COMPOSE_FILES[site], EXTERNAL_OVERLAYS[site]), env
+            )
+            for site in COMPOSE_FILES
+        }
+        cls.mismatched_external_configs = {
+            "primary-with-dr-overlay": cls._render(
+                docker, (COMPOSE_FILES["primary"], EXTERNAL_OVERLAYS["dr"]), env
+            ),
+            "dr-with-primary-overlay": cls._render(
+                docker, (COMPOSE_FILES["dr"], EXTERNAL_OVERLAYS["primary"]), env
+            ),
+        }
+        cls.external_after_local_override = {
+            site: cls._render(
+                docker,
+                (
+                    COMPOSE_FILES[site],
+                    cls._unsafe_external_override,
+                    EXTERNAL_OVERLAYS[site],
+                ),
+                env,
+            )
+            for site in COMPOSE_FILES
+        }
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -65,9 +109,18 @@ class ComposePolicyTests(unittest.TestCase):
             cls._tempdir.cleanup()
 
     @staticmethod
-    def _render(docker: str, compose_file: Path, env: dict[str, str]) -> dict:
+    def _render(
+        docker: str, compose_files: Path | tuple[Path, ...], env: dict[str, str]
+    ) -> dict:
+        if isinstance(compose_files, Path):
+            compose_files = (compose_files,)
+        compose_args = [
+            argument
+            for compose_file in compose_files
+            for argument in ("-f", str(compose_file))
+        ]
         result = subprocess.run(
-            [docker, "compose", "-f", str(compose_file), "config", "--format", "json"],
+            [docker, "compose", *compose_args, "config", "--format", "json"],
             cwd=ROOT,
             env=env,
             text=True,
@@ -76,7 +129,7 @@ class ComposePolicyTests(unittest.TestCase):
         )
         if result.returncode:
             raise AssertionError(
-                f"{compose_file.name} failed validation:\n{result.stdout}\n{result.stderr}"
+                f"{compose_files} failed validation:\n{result.stdout}\n{result.stderr}"
             )
         return json.loads(result.stdout)
 
@@ -94,6 +147,75 @@ class ComposePolicyTests(unittest.TestCase):
                     "otel-watcher",
                     "vm-sync",
                 }.issubset(config["services"])
+            )
+
+    def test_external_replication_mode_disables_repository_sync(self) -> None:
+        expected_services = {
+            "victoriametrics",
+            "clickhouse",
+            "otel-collector",
+            "grafana",
+            "dns-failover",
+            "otel-watcher",
+        }
+        local_pipeline = ROOT / "services/otel_collector/pipelines.local-only.yaml"
+        pipeline_text = local_pipeline.read_text(encoding="utf-8")
+        self.assertIn("prometheusremotewrite/local", pipeline_text)
+        self.assertIn("clickhouse", pipeline_text)
+        self.assertNotIn("prometheusremotewrite/peer", pipeline_text)
+
+        for site, config in self.external_configs.items():
+            services = config["services"]
+            self.assertEqual(set(services), expected_services, site)
+            self.assertNotIn("vm-sync", services)
+            self.assertNotIn("ch-sync", services)
+
+            collector = services["otel-collector"]
+            self.assertEqual(
+                collector["environment"]["DATA_REPLICATION_MODE"], "external"
+            )
+            pipeline_mounts = [
+                mount
+                for mount in collector["volumes"]
+                if mount.get("target")
+                == "/etc/otel-collector-config/pipelines.yaml"
+            ]
+            self.assertEqual(len(pipeline_mounts), 1)
+            self.assertTrue(pipeline_mounts[0]["read_only"])
+            self.assertEqual(
+                Path(pipeline_mounts[0]["source"]).resolve(),
+                local_pipeline.resolve(),
+            )
+
+        self.assertNotIn(
+            "primary_clickhouse_password",
+            self.external_configs["dr"].get("secrets", {}),
+        )
+
+    def test_mismatched_external_overlay_still_fails_closed(self) -> None:
+        for label, config in self.mismatched_external_configs.items():
+            services = config["services"]
+            self.assertNotIn("vm-sync", services, label)
+            self.assertNotIn("ch-sync", services, label)
+            self.assertEqual(
+                services["otel-collector"]["environment"][
+                    "DATA_REPLICATION_MODE"
+                ],
+                "external",
+                label,
+            )
+
+    def test_external_overlay_applied_last_cannot_be_undone_locally(self) -> None:
+        for site, config in self.external_after_local_override.items():
+            services = config["services"]
+            self.assertNotIn("vm-sync", services, site)
+            self.assertNotIn("ch-sync", services, site)
+            self.assertEqual(
+                services["otel-collector"]["environment"][
+                    "DATA_REPLICATION_MODE"
+                ],
+                "external",
+                site,
             )
 
     def test_watcher_uses_the_authoritative_failover_environment(self) -> None:
@@ -287,10 +409,38 @@ class ComposePolicyTests(unittest.TestCase):
         preflight = (ROOT / "services/preflight.sh").read_text(encoding="utf-8")
         self.assertIn("config --format json", preflight)
         self.assertIn("json.loads", preflight)
+        self.assertIn('docker compose "$@"', preflight)
+        self.assertIn("DATA_REPLICATION_MODE", preflight)
+        self.assertIn("prometheusremotewrite/peer", preflight)
         self.assertIn('/run/source-otel-config/receivers.yaml', preflight)
         self.assertIn("2.24.0", preflight)
         self.assertIn("amd64", preflight)
         self.assertNotIn("required_secrets=", preflight)
+
+    def test_external_transition_removes_old_sync_containers_without_volumes(self) -> None:
+        helper = (
+            ROOT / "services/activate-external-replication.sh"
+        ).read_text(encoding="utf-8")
+        self.assertLess(
+            helper.index("services/preflight.sh"),
+            helper.index("remove_sync_service_containers vm-sync"),
+        )
+        self.assertIn("com.docker.compose.project", helper)
+        self.assertIn("com.docker.compose.service", helper)
+        self.assertIn("com.docker.compose.oneoff=True", helper)
+        self.assertIn("otel-collector", helper)
+        self.assertIn('set -- -f "$base" "$@" -f "$overlay"', helper)
+        self.assertIn('docker compose "$@" config --format json', helper)
+        self.assertIn('docker compose "$@" up -d', helper)
+        self.assertNotIn("--remove-orphans", helper)
+        self.assertIn("belongs to Compose project", helper)
+        self.assertIn("remove_sync_service_containers vm-sync", helper)
+        self.assertIn("remove_sync_service_containers ch-sync", helper)
+        self.assertIn("assert_sync_service_absent ch-sync", helper)
+        self.assertIn('docker stop "$container_id"', helper)
+        self.assertIn('docker rm "$container_id"', helper)
+        self.assertIn("docker container inspect", helper)
+        self.assertNotIn("--volumes", helper)
 
     def test_dns_custom_provider_scripts_are_mounted_read_only(self) -> None:
         for config in self.configs.values():

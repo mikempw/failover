@@ -14,6 +14,10 @@ Only the site whose IPv4 address is the single A answer for `DNS_RECORD` should 
 
 The TXT value has the form `owner=primary exp=UNIX_TIME` or `owner=dr exp=UNIX_TIME`. The A address, owner, and configured site IP must agree. Controllers fail closed when that state is absent or incoherent.
 
+An opt-in external-replication overlay replaces the three cross-site data
+paths with local-only ingestion. It does not change DNS ownership or collector
+fencing, and it does not add a replication-completeness check.
+
 ## Prepare each site
 
 ### Local files
@@ -73,6 +77,68 @@ the `primary_vm_sync_state` and `dr_vm_sync_state` named volumes during routine
 upgrades; deleting either discards that site's progress watermark and causes a
 replay from the configured start timestamp, or only from the current lookback
 when the timestamp is unset.
+
+The peer VictoriaMetrics values, `VM_SYNC_START_TIMESTAMP`, primary ClickHouse
+source settings, and `primary_clickhouse_password.txt` are needed by the
+built-in replication mode. They are not consumed by this repository when the
+external-replication overlay is active. The external replicator may still need
+its own network allowlists and credentials.
+
+### External replication mode
+
+Use this mode only if a system other than WireGuard copies both VictoriaMetrics
+and ClickHouse data. WireGuard authenticates and encrypts peers, but does not
+replicate application or storage data.
+
+The external mode makes these changes:
+
+- The collector writes only to local VictoriaMetrics and local ClickHouse.
+- `vm-sync` is disabled at both sites.
+- `ch-sync` is disabled at DR.
+- DNS failover does not check external replica lag or completeness.
+
+Activate each site with the transition helper:
+
+```sh
+sh services/activate-external-replication.sh primary  # on primary
+sh services/activate-external-replication.sh dr       # on DR
+```
+
+If the site normally uses additional Compose options, append them to the
+helper command, for example:
+
+```sh
+sh services/activate-external-replication.sh primary \
+  -f docker-compose.local.yaml -p ast-primary-custom
+```
+
+The same options are used for validation, project-label cleanup, and startup,
+so local mounts, environment, and services are not discarded. The external
+safety overlay is applied last so a local override cannot re-enable a sync
+path. The helper refuses to proceed if any `otel-collector` one-off still
+exists, including a stopped one; remove that one-off first.
+
+The helper validates first, then stops and removes any existing `vm-sync` and
+`ch-sync` containers without deleting their named state volumes. It starts
+the merged external model without removing unrelated services and verifies
+those sync containers—including detached Compose one-offs—are absent both
+before and after startup. Do not migrate a
+running site with a plain overlay `up -d`: a sync container created by the base
+model can otherwise retain its old environment and continue copying.
+
+Use the same two-file form for every later `pull`, `build`, `run`, `up`,
+`stop`, and `down` command. A base manifest used alone restores built-in sync.
+Do not explicitly enable the `builtin-replication-disabled` profile with an
+external overlay; the sync executables also refuse to start when
+`DATA_REPLICATION_MODE=external`.
+
+Before production use, define the acceptable recovery point and independently
+alert on external replication lag and errors. If the external system performs
+block or volume replication, it must also guarantee that only one copy is
+writable and mounted. This stack fences the collector, not the storage engine.
+Promotion remains availability-first and may expose stale data. Keep
+`AUTO_FAILBACK=false`; do not fail back until the external system has copied
+DR writes to primary and an operator has validated both data stores.
 
 ### BIG-IP receiver secrets
 

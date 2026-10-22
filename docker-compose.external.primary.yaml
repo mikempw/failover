@@ -1,0 +1,22 @@
+# Opt-in overlay for deployments whose data replication is managed outside
+# this repository. Use together with docker-compose.primary.yaml.
+services:
+  otel-collector:
+    environment:
+      DATA_REPLICATION_MODE: external
+    volumes:
+      - ./services/otel_collector/pipelines.local-only.yaml:/etc/otel-collector-config/pipelines.yaml:ro
+
+  vm-sync:
+    profiles:
+      - builtin-replication-disabled
+    environment:
+      DATA_REPLICATION_MODE: external
+
+  # Also fence ch-sync so accidentally pairing this overlay with the DR base
+  # fails closed instead of leaving ClickHouse replication running.
+  ch-sync:
+    profiles:
+      - builtin-replication-disabled
+    environment:
+      DATA_REPLICATION_MODE: external

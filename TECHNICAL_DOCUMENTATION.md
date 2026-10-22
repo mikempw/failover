@@ -30,6 +30,10 @@ Each stack loads its committed site example first, then an optional root
 Operators should keep only one writable site file; the legacy location wins if
 both are present.
 
+The optional `docker-compose.external.primary.yaml` and
+`docker-compose.external.dr.yaml` overlays remove the repository-owned
+cross-site data paths while preserving the control plane and local ingestion.
+
 ## Control-plane flow
 
 ```text
@@ -357,6 +361,41 @@ DR ingestion without changing DNS.
 
 The synchronizer does not detect same-row-count content differences, alter existing schemas, remove destination-only partitions, or replicate non-MergeTree tables. Validate those cases separately.
 
+## External replication mode
+
+External mode is selected only by explicitly merging the appropriate external
+overlay with a base manifest. The default remains `builtin`. In the rendered
+external model:
+
+- profiled `vm-sync` and `ch-sync` services are inactive;
+- `pipelines.local-only.yaml` removes `prometheusremotewrite/peer` from the
+  collector metrics pipeline; and
+- `DATA_REPLICATION_MODE=external` makes either sync executable fail
+  configuration if it is explicitly targeted despite its inactive profile.
+
+Preflight validates the merged Compose model and the local-only pipeline. It
+does not test an external replicator. The external system owns copy direction,
+credentials, transport, lag monitoring, recovery-point guarantees, reverse
+recovery, and any storage-level single-writer fencing. WireGuard can protect
+the transport but supplies none of those replication semantics.
+
+Compose profiles do not retroactively stop a container created from the base
+model. `services/activate-external-replication.sh` therefore validates the
+merged model, explicitly stops and removes the built-in sync containers while
+retaining their named volumes, and starts the external model without removing
+unrelated services. It derives the effective project name from Compose,
+includes any operator-supplied Compose options consistently, applies the
+safety overlay last, and refuses to transition while any collector one-off
+exists. A plain overlay `up` is not a valid migration procedure.
+
+The DNS controller consumes no `vm-sync`, `ch-sync`, or external-replication
+status before promotion. Existing `LOCAL_HEALTH_URL` checks DR-local backing
+service availability, not replica equality. `FAILBACK_HEALTH_URL` can point to
+an operator-managed composite recovery gate, but manual `promote` and
+`failback` remain explicit overrides. External mode is therefore an
+availability-first configuration that can expose data older than the intended
+recovery point. `AUTO_FAILBACK=false` is the safe default.
+
 ## Observability
 
 `common/health_server.py` supplies a dependency-free status server to all Python control services.
@@ -594,6 +633,12 @@ sh services/preflight.sh docker-compose.primary.yaml
 sh services/preflight.sh docker-compose.dr.yaml
 docker compose -f docker-compose.primary.yaml config --quiet
 docker compose -f docker-compose.dr.yaml config --quiet
+
+# External-replication variants
+sh services/preflight.sh -f docker-compose.primary.yaml -f docker-compose.external.primary.yaml
+sh services/preflight.sh -f docker-compose.dr.yaml -f docker-compose.external.dr.yaml
+docker compose -f docker-compose.primary.yaml -f docker-compose.external.primary.yaml config --quiet
+docker compose -f docker-compose.dr.yaml -f docker-compose.external.dr.yaml config --quiet
 ```
 
 `services/preflight.sh` additionally enforces Docker Compose 2.24 or newer, an

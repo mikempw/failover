@@ -98,6 +98,13 @@ def ch_proof(owner: str, ip: str, *, expires_at: int = 2_000):
 
 
 class VictoriaMetricsSyncTests(unittest.TestCase):
+    def test_external_replication_mode_refuses_to_start(self):
+        with mock.patch.dict(
+            os.environ, {"DATA_REPLICATION_MODE": "external"}, clear=True
+        ):
+            with self.assertRaisesRegex(ValueError, "vm-sync is disabled"):
+                vm_sync.Config.from_env()
+
     def test_explicit_start_timestamp_anchors_a_missing_watermark(self):
         with tempfile.TemporaryDirectory() as directory:
             state_file = Path(directory) / "state.json"
@@ -349,6 +356,13 @@ class RecordingClient:
 
 
 class ClickHouseSyncTests(unittest.TestCase):
+    def test_external_replication_mode_refuses_to_start(self):
+        with mock.patch.dict(
+            os.environ, {"DATA_REPLICATION_MODE": "external"}, clear=True
+        ):
+            with self.assertRaisesRegex(ValueError, "ch-sync is disabled"):
+                ch_sync.Config.from_env()
+
     def make_service(self):
         http = ch_sync.RetryingHttpClient(5, 1, 0, 0)
         return ch_sync.ClickHouseSync(ch_config(), http=http, clock=lambda: 1000.0)

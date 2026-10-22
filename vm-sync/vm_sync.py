@@ -90,6 +90,18 @@ def _secret(name: str) -> str:
     return value or ""
 
 
+def _require_builtin_replication() -> None:
+    mode = os.getenv("DATA_REPLICATION_MODE", "builtin").strip().lower()
+    if mode not in {"builtin", "external"}:
+        raise ValueError(
+            "DATA_REPLICATION_MODE must be either 'builtin' or 'external'"
+        )
+    if mode == "external":
+        raise ValueError(
+            "vm-sync is disabled because DATA_REPLICATION_MODE=external"
+        )
+
+
 @dataclass(frozen=True)
 class Endpoint:
     url: str
@@ -152,6 +164,7 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        _require_builtin_replication()
         interval = _positive_int("SYNC_INTERVAL", 300)
         lookback_minutes = _positive_int("SYNC_LOOKBACK", 30)
         chunk = _positive_int("SYNC_CHUNK_SECONDS", 300)

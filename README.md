@@ -51,6 +51,58 @@ while DR is active must first be copied back to primary.
 
 The watcher uses Linux host networking and the Docker socket. This deployment is not suitable for Docker Desktop without adaptation.
 
+## External replication mode
+
+WireGuard is an encrypted network transport; it does not copy VictoriaMetrics
+or ClickHouse data. If a separate product actually replicates both stores over
+that network, this repository can leave data replication to it by applying the
+site-specific external overlay:
+
+```sh
+# Primary
+docker compose -f docker-compose.primary.yaml \
+  -f docker-compose.external.primary.yaml config --services
+
+# DR
+docker compose -f docker-compose.dr.yaml \
+  -f docker-compose.external.dr.yaml config --services
+```
+
+The overlays disable `vm-sync`, DR `ch-sync`, and the collector's peer
+VictoriaMetrics remote write. The active collector continues writing to its
+local VictoriaMetrics and ClickHouse. Local storage, Grafana, DNS failover,
+the watcher, and collector ownership fencing remain enabled. Always pass both
+files to preflight and every Compose lifecycle command; omitting the overlay
+re-enables the built-in replication model.
+
+To migrate a new or running site safely, use the transition helper. It
+validates the merged model, stops and removes any built-in sync
+containers, preserves their named state volumes, and starts the external model
+without touching unrelated services. It also verifies that the sync containers
+are absent:
+
+```sh
+sh services/activate-external-replication.sh primary  # on primary
+sh services/activate-external-replication.sh dr       # on DR
+```
+
+Append any local Compose options used by the site, for example
+`-f docker-compose.local.yaml` or `-p custom-project`. The helper passes them
+through consistently and derives the effective project name from the rendered
+model. The external safety overlay is always applied last. It refuses
+activation while any collector one-off remains, even if it is stopped.
+
+A plain overlay `up -d` is not a safe migration command because an existing
+sync container created from the base model may otherwise keep running.
+
+This mode deliberately does not tell the DNS controller whether external
+replicas are complete. Promotion can therefore expose stale or incomplete
+data. Use it only when the external system has a declared recovery point,
+alerts on replication failure, and its own single-writer or storage fencing.
+Keep `AUTO_FAILBACK=false` unless an operator-managed `FAILBACK_HEALTH_URL`
+proves primary recovery. If WireGuard is the only added component, do not use
+this mode.
+
 ## Secure quick start
 
 Run the following in a clone of this repository on each site. Files without `.example` suffixes are ignored by Git.
@@ -180,6 +232,20 @@ the dedicated collector and DNS-provider secret directories, the receiver
 file, and the rendered Compose model. DNS validation checks provider-specific
 settings, addresses, timing constraints, and health configuration. It does not
 prove production connectivity to every external service.
+
+For external replication, validate the merged model instead. The external
+preflight also verifies that the sync services and peer remote write are absent:
+
+```sh
+# Run the matching command on each site.
+sh services/preflight.sh -f docker-compose.primary.yaml \
+  -f docker-compose.external.primary.yaml
+sh services/preflight.sh -f docker-compose.dr.yaml \
+  -f docker-compose.external.dr.yaml
+```
+
+Use `services/activate-external-replication.sh` for the actual transition; the
+standalone preflight does not stop previously running sync containers.
 
 ### 5. Initialize the lease, then start primary
 

@@ -55,6 +55,13 @@ jobs:
       - name: Validate DR compose model
         run: docker compose -f docker-compose.dr.yaml config --quiet
 
+      - name: Validate external-replication compose models
+        run: |
+          docker compose -f docker-compose.primary.yaml \
+            -f docker-compose.external.primary.yaml config --quiet
+          docker compose -f docker-compose.dr.yaml \
+            -f docker-compose.external.dr.yaml config --quiet
+
       - name: Build primary custom images
         run: docker compose -f docker-compose.primary.yaml build
 
@@ -64,6 +71,12 @@ jobs:
       - name: Validate collector config and staged-file permissions
         run: >-
           docker compose -f docker-compose.primary.yaml run --rm --no-deps
+          -e OTEL_CONFIG_VALIDATE_ONLY=1 otel-collector
+
+      - name: Validate external-replication collector config
+        run: >-
+          docker compose -f docker-compose.primary.yaml
+          -f docker-compose.external.primary.yaml run --rm --no-deps
           -e OTEL_CONFIG_VALIDATE_ONLY=1 otel-collector
 
       - name: Smoke-test fresh ClickHouse and Grafana volumes

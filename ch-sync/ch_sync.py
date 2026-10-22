@@ -61,6 +61,18 @@ def _secret(name: str) -> str:
     return value or ""
 
 
+def _require_builtin_replication() -> None:
+    mode = os.getenv("DATA_REPLICATION_MODE", "builtin").strip().lower()
+    if mode not in {"builtin", "external"}:
+        raise ValueError(
+            "DATA_REPLICATION_MODE must be either 'builtin' or 'external'"
+        )
+    if mode == "external":
+        raise ValueError(
+            "ch-sync is disabled because DATA_REPLICATION_MODE=external"
+        )
+
+
 def quote_identifier(value: str) -> str:
     if not value or "\x00" in value:
         raise ValueError("ClickHouse identifier must not be empty or contain NUL")
@@ -167,6 +179,7 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        _require_builtin_replication()
         interval = _positive_int("SYNC_INTERVAL", 300)
         databases = [
             item.strip()
