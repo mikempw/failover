@@ -11,7 +11,7 @@ COPY --from=privilege-helper /drop-privileges /usr/local/bin/drop-privileges
 COPY services/grafana/secure-entrypoint.sh /usr/local/bin/secure-grafana-entrypoint.sh
 RUN mkdir -p "$GF_PATHS_PLUGINS" \
     && grafana cli --pluginsDir "$GF_PATHS_PLUGINS" plugins install \
-      grafana-clickhouse-datasource 4.14.1 \
+      grafana-clickhouse-datasource 4.14.0 \
     && chown -R grafana:root "$GF_PATHS_PLUGINS" \
     && chmod 0755 /usr/local/bin/drop-privileges /usr/local/bin/secure-grafana-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/secure-grafana-entrypoint.sh"]

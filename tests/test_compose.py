@@ -203,7 +203,7 @@ class ComposePolicyTests(unittest.TestCase):
         grafana_dockerfile = (ROOT / "services/grafana/Dockerfile").read_text(
             encoding="utf-8"
         )
-        self.assertIn("grafana-clickhouse-datasource 4.14.1", grafana_dockerfile)
+        self.assertIn("grafana-clickhouse-datasource 4.14.0", grafana_dockerfile)
         self.assertIn("GF_PATHS_PLUGINS=/var/lib/grafana-plugins", grafana_dockerfile)
         self.assertNotIn("--pluginsDir /var/lib/grafana/plugins", grafana_dockerfile)
         self.assertIn("drop-privileges", grafana_dockerfile)
