@@ -39,8 +39,9 @@ while DR is active must first be copied back to primary.
 
 ## Requirements
 
-- Two Linux/amd64 Docker hosts, normally one per site; the pinned upstream AST
-  collector image does not provide an arm64 variant
+- Two Docker hosts, normally one per site. The full and external-replication
+  stacks require Linux/amd64 because the pinned AST collector has no arm64
+  image; the standalone DNS-only controller does not include that image.
 - Docker Engine with Docker Compose v2.24 or newer (the manifests use
   `env_file.required`)
 - A DNS provider supported by `failover/dns_failover.py`, or two custom provider scripts
@@ -49,7 +50,106 @@ while DR is active must first be copied back to primary.
   absolute Unix time
 - Python 3.11+ for `services/preflight.sh`, the setup wizard, or tests on the host
 
-The watcher uses Linux host networking and the Docker socket. This deployment is not suitable for Docker Desktop without adaptation.
+The watcher in the full and external-replication stacks uses Linux host
+networking and the Docker socket. Those stacks are not suitable for Docker
+Desktop without adaptation.
+
+## DNS-only control plane
+
+Use the dedicated DNS-only manifests when WireGuard, replication, storage,
+collectors, and application lifecycle are owned outside this repository:
+
+- `docker-compose.dns-only.primary.yaml`
+- `docker-compose.dns-only.dr.yaml`
+
+Each model contains exactly one `dns-failover` service. It has no Docker
+socket, application secrets, collector, watcher, database, dashboard, or sync
+job. Its only action is to read and update the managed A record and companion
+TXT lease. The primary and DR roles are fixed in their respective manifests.
+
+This is deliberately a traffic-control mode, not a data-safety system. It
+does not inspect WireGuard, replication lag, data completeness, or which site
+is writable, and it cannot fence an old application instance. DNS caches can
+also continue using the former address until their cached TTL expires. The
+external platform must provide single-writer/fencing guarantees and must keep
+the services at `PRIMARY_IP` and `DR_IP` ready for traffic.
+
+Configure three direct HTTP endpoints in root `.env`:
+
+- `DNS_ONLY_PRIMARY_HEALTH_URL`: primary availability, used for primary lease
+  renewal and DR failure detection.
+- `DNS_ONLY_DR_HEALTH_URL`: DR readiness, required before DR promotion and for
+  every DR lease renewal.
+- `DNS_ONLY_PRIMARY_FAILBACK_HEALTH_URL`: a separate primary recovery gate,
+  used before primary reclamation and by optional automatic failback.
+
+These URLs must address a site directly. Never use `DNS_RECORD`, because it
+moves to whichever site currently owns the lease. The repository trusts an
+HTTP 2xx response; the external owner decides whether a readiness endpoint
+also proves replication and fencing. Keep `AUTO_FAILBACK=false` unless the
+recovery URL is a trustworthy composite gate.
+
+For a fresh deployment, create the ignored local files and replace every
+TEST-NET/example value. DNS provider credentials remain in `.env.primary` or
+`.env.dr` (prefer `NAME_FILE=/secrets/name` for secrets); the three health
+values are Compose substitutions from root `.env` or the shell:
+
+```sh
+cp .env.dns-only.example .env
+cp failover/.env.primary.example .env.primary  # primary host
+# or: cp failover/.env.dr.example .env.dr      # DR host
+mkdir -p secrets/failover
+```
+
+Validate and initialize primary once, after the externally managed primary is
+ready:
+
+```sh
+sh services/preflight.sh docker-compose.dns-only.primary.yaml
+docker compose -f docker-compose.dns-only.primary.yaml build --pull
+docker compose -f docker-compose.dns-only.primary.yaml run --rm --no-deps \
+  dns-failover validate
+docker compose -f docker-compose.dns-only.primary.yaml run --rm --no-deps \
+  dns-failover init
+sh services/activate-dns-only.sh primary
+```
+
+Then validate and start DR:
+
+```sh
+sh services/preflight.sh docker-compose.dns-only.dr.yaml
+docker compose -f docker-compose.dns-only.dr.yaml build --pull
+docker compose -f docker-compose.dns-only.dr.yaml run --rm --no-deps \
+  dns-failover validate
+sh services/activate-dns-only.sh dr
+```
+
+On a host that previously ran this repository's full stack, the activation
+helper refuses to retire other project containers without an explicit
+confirmation. Once confirmed, it probes every external gate used by that role
+and brings the controller up healthy before stopping the old stack. Move the
+data plane outside this Compose project and build the DNS controller image
+first, then run:
+
+```sh
+docker compose -f docker-compose.dns-only.primary.yaml build --pull
+DNS_ONLY_CONFIRM=RETIRE_REPOSITORY_STACK \
+  sh services/activate-dns-only.sh primary  # use dr on the DR host
+```
+
+The confirmed transition stops the Docker-socket watcher first, removes every
+other same-project container (including operator-added override services)
+without deleting named volumes, recreates the controller, waits for fresh
+readiness, and verifies it is the project's sole container. The helper prints
+the retirement set before requiring confirmation. Preserve any original `-p`
+or `COMPOSE_PROJECT_NAME` project identity when invoking it. Do not use a plain
+DNS-only `up -d` to migrate a running full stack: Compose does not remove
+services omitted from a new file.
+
+Manual `init`, `promote`, and `failback` commands write DNS immediately and
+bypass the loop's failure threshold, lease-expiry wait, and health gates. Use
+them only as audited operator overrides. See the DNS-only runbook in
+[USER_GUIDE.md](USER_GUIDE.md).
 
 ## External replication mode
 

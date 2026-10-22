@@ -176,6 +176,104 @@ class ConfigAndLeaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'LOCAL_HEALTH_URL must be an absolute'):
             cfg.validate()
 
+    def test_dns_only_requires_external_site_specific_health_gates(self):
+        valid = make_config(
+            deployment_mode='dns-only',
+            role='dr',
+            health_mode='http',
+            health_url='http://192.0.2.10:8080/health',
+            local_health_url='http://192.0.2.20:8080/ready-for-traffic',
+            failback_health_url='http://192.0.2.10:8080/recovery-ready',
+        )
+        valid.validate()
+
+        with self.assertRaisesRegex(ValueError, 'LOCAL_HEALTH_URL is required'):
+            make_config(
+                deployment_mode='dns-only',
+                role='dr',
+                health_mode='http',
+                health_url='http://192.0.2.10:8080/health',
+                failback_health_url='http://192.0.2.10:8080/recovery-ready',
+            ).validate()
+
+        with self.assertRaisesRegex(ValueError, 'FAILBACK_HEALTH_URL is required'):
+            make_config(
+                deployment_mode='dns-only',
+                health_mode='http',
+                health_url='http://192.0.2.10:8080/health',
+            ).validate()
+
+        with self.assertRaisesRegex(ValueError, 'HEALTH_MODE must be http'):
+            make_config(
+                deployment_mode='dns-only',
+                health_mode='tcp',
+                failback_health_url='http://192.0.2.10:8080/recovery-ready',
+            ).validate()
+
+    def test_dns_only_rejects_moving_or_compose_local_health_targets(self):
+        for setting, overrides in (
+            ('HEALTH_URL', {'health_url': 'http://failover.example.test/health'}),
+            ('LOCAL_HEALTH_URL', {'local_health_url': 'http://victoriametrics:8428/health'}),
+            ('FAILBACK_HEALTH_URL', {'failback_health_url': 'http://localhost:8080/ready'}),
+        ):
+            values = dict(
+                deployment_mode='dns-only',
+                role='dr',
+                health_mode='http',
+                health_url='http://192.0.2.10:8080/health',
+                local_health_url='http://192.0.2.20:8080/ready',
+                failback_health_url='http://192.0.2.10:8080/recovery-ready',
+            )
+            values.update(overrides)
+            with self.subTest(setting=setting), self.assertRaisesRegex(
+                ValueError, f'{setting} must target an external'
+            ):
+                make_config(**values).validate()
+
+    def test_invalid_deployment_mode_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'Invalid DEPLOYMENT_MODE'):
+            make_config(deployment_mode='not-a-mode').validate()
+
+    @mock.patch('failover.dns_failover.check_http', return_value=True)
+    def test_dns_only_probe_checks_all_configured_external_gates(self, check_http):
+        cfg = make_config(
+            deployment_mode='dns-only',
+            role='dr',
+            health_mode='http',
+            health_url='http://192.0.2.10:8080/health',
+            local_health_url='http://192.0.2.20:8080/ready',
+            failback_health_url='http://192.0.2.10:8080/recovery-ready',
+        )
+        dns.probe_dns_only_health(cfg)
+        self.assertEqual(
+            [call.args[0] for call in check_http.call_args_list],
+            [cfg.health_url, cfg.local_health_url, cfg.failback_health_url],
+        )
+
+    @mock.patch('failover.dns_failover.check_http', side_effect=[True, False])
+    def test_dns_only_probe_fails_when_an_external_gate_is_unready(self, _check_http):
+        cfg = make_config(
+            deployment_mode='dns-only',
+            health_mode='http',
+            health_url='http://192.0.2.10:8080/health',
+            failback_health_url='http://192.0.2.10:8080/recovery-ready',
+        )
+        with self.assertRaisesRegex(RuntimeError, 'primary recovery'):
+            dns.probe_dns_only_health(cfg)
+
+    @mock.patch('failover.dns_failover.check_http', return_value=True)
+    def test_dns_only_dr_outage_probe_checks_local_readiness_only(self, check_http):
+        cfg = make_config(
+            deployment_mode='dns-only',
+            role='dr',
+            health_mode='http',
+            health_url='http://192.0.2.10:8080/health',
+            local_health_url='http://192.0.2.20:8080/ready',
+            failback_health_url='http://192.0.2.10:8080/recovery-ready',
+        )
+        dns.probe_dns_only_dr_readiness(cfg)
+        check_http.assert_called_once_with(cfg.local_health_url, cfg.health_timeout)
+
     def test_incoherent_or_partial_lease_is_rejected(self):
         cfg = make_config()
         with self.assertRaises(dns.LeaseReadError):
@@ -264,6 +362,44 @@ class ConfigAndLeaseTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {'AUTO_FAILBACK': 'sometimes'}, clear=True):
             with self.assertRaisesRegex(ValueError, 'AUTO_FAILBACK must be true or false'):
                     dns.Config.from_env()
+
+    def test_role_and_deployment_mode_cannot_be_overridden_by_vault(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                'ROLE': 'dr',
+                'DEPLOYMENT_MODE': 'dns-only',
+                'HEALTH_MODE': 'http',
+                'HEALTH_URL': 'http://192.0.2.10:8080/health',
+                'LOCAL_HEALTH_URL': 'http://192.0.2.20:8080/ready',
+                'FAILBACK_HEALTH_URL': 'http://192.0.2.10:8080/recovery-ready',
+                'AUTO_FAILBACK': 'false',
+            },
+            clear=True,
+        ), mock.patch.object(
+            dns,
+            'load_from_vault',
+            return_value={
+                'role': 'primary',
+                'deployment_mode': 'full',
+                'health_mode': 'tcp',
+                'health_url': 'http://wrong.example.test/health',
+                'local_health_url': 'http://wrong.example.test/local',
+                'failback_health_url': 'http://wrong.example.test/recovery',
+                'auto_failback': 'true',
+            },
+        ):
+            cfg = dns.Config.from_env()
+        self.assertEqual(cfg.role, 'dr')
+        self.assertEqual(cfg.deployment_mode, 'dns-only')
+        self.assertEqual(cfg.health_mode, 'http')
+        self.assertEqual(cfg.health_url, 'http://192.0.2.10:8080/health')
+        self.assertEqual(cfg.local_health_url, 'http://192.0.2.20:8080/ready')
+        self.assertEqual(
+            cfg.failback_health_url,
+            'http://192.0.2.10:8080/recovery-ready',
+        )
+        self.assertFalse(cfg.auto_failback)
 
     def test_auto_failback_requires_recovery_url_at_either_role(self):
         with self.assertRaisesRegex(ValueError, 'FAILBACK_HEALTH_URL'):

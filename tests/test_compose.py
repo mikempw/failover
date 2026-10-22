@@ -20,6 +20,10 @@ EXTERNAL_OVERLAYS = {
     "primary": ROOT / "docker-compose.external.primary.yaml",
     "dr": ROOT / "docker-compose.external.dr.yaml",
 }
+DNS_ONLY_FILES = {
+    "primary": ROOT / "docker-compose.dns-only.primary.yaml",
+    "dr": ROOT / "docker-compose.dns-only.dr.yaml",
+}
 
 
 class ComposePolicyTests(unittest.TestCase):
@@ -70,6 +74,11 @@ class ComposePolicyTests(unittest.TestCase):
                 ),
                 "BIND_ADDRESS": "127.0.0.1",
                 "CLICKHOUSE_REMOTE_CIDRS": "198.51.100.0/24",
+                "DNS_ONLY_PRIMARY_HEALTH_URL": "http://192.0.2.10:8080/health",
+                "DNS_ONLY_DR_HEALTH_URL": "http://192.0.2.20:8080/ready-for-traffic",
+                "DNS_ONLY_PRIMARY_FAILBACK_HEALTH_URL": (
+                    "http://192.0.2.10:8080/recovery-ready"
+                ),
             }
         )
         cls.configs = {
@@ -101,6 +110,10 @@ class ComposePolicyTests(unittest.TestCase):
                 env,
             )
             for site in COMPOSE_FILES
+        }
+        cls.dns_only_configs = {
+            site: cls._render(docker, compose_file, env)
+            for site, compose_file in DNS_ONLY_FILES.items()
         }
 
     @classmethod
@@ -148,6 +161,66 @@ class ComposePolicyTests(unittest.TestCase):
                     "vm-sync",
                 }.issubset(config["services"])
             )
+
+    def test_dns_only_models_contain_only_the_forced_role_controller(self) -> None:
+        for site, config in self.dns_only_configs.items():
+            self.assertEqual(set(config["services"]), {"dns-failover"}, site)
+            self.assertFalse(config.get("secrets"), site)
+
+            service = config["services"]["dns-failover"]
+            environment = service["environment"]
+            self.assertEqual(environment["ROLE"], site)
+            self.assertEqual(environment["DEPLOYMENT_MODE"], "dns-only")
+            self.assertFalse(service.get("ports"))
+            self.assertFalse(service.get("depends_on"))
+
+            mounts = {mount["target"]: mount for mount in service["volumes"]}
+            self.assertEqual(
+                set(mounts),
+                {"/state", "/run/source-secrets", "/run/source-scripts"},
+            )
+            self.assertEqual(mounts["/state"]["type"], "volume")
+            self.assertFalse(mounts["/state"].get("read_only", False))
+            for target in ("/run/source-secrets", "/run/source-scripts"):
+                self.assertEqual(mounts[target]["type"], "bind")
+                self.assertTrue(mounts[target]["read_only"])
+            self.assertNotIn(
+                "/var/run/docker.sock",
+                {mount.get("source") for mount in service["volumes"]},
+            )
+
+            full_state = next(
+                mount["source"]
+                for mount in self.configs[site]["services"]["dns-failover"]["volumes"]
+                if mount.get("target") == "/state"
+            )
+            self.assertEqual(mounts["/state"]["source"], full_state)
+
+        primary_env = self.dns_only_configs["primary"]["services"]["dns-failover"]["environment"]
+        dr_env = self.dns_only_configs["dr"]["services"]["dns-failover"]["environment"]
+        self.assertEqual(primary_env["HEALTH_URL"], "http://192.0.2.10:8080/health")
+        self.assertEqual(dr_env["HEALTH_URL"], primary_env["HEALTH_URL"])
+        self.assertEqual(dr_env["LOCAL_HEALTH_URL"], "http://192.0.2.20:8080/ready-for-traffic")
+        self.assertEqual(primary_env["LOCAL_HEALTH_URL"], "")
+        self.assertEqual(
+            primary_env["FAILBACK_HEALTH_URL"],
+            "http://192.0.2.10:8080/recovery-ready",
+        )
+        self.assertEqual(
+            dr_env["FAILBACK_HEALTH_URL"],
+            primary_env["FAILBACK_HEALTH_URL"],
+        )
+
+    def test_dns_only_health_inputs_are_required_and_role_is_not_operator_overridable(self) -> None:
+        for site, compose_file in DNS_ONLY_FILES.items():
+            text = compose_file.read_text(encoding="utf-8")
+            self.assertIn("DNS_ONLY_PRIMARY_HEALTH_URL:?", text)
+            self.assertIn("DNS_ONLY_PRIMARY_FAILBACK_HEALTH_URL:?", text)
+            self.assertIn(f"ROLE: {site}", text)
+        self.assertIn(
+            "DNS_ONLY_DR_HEALTH_URL:?",
+            DNS_ONLY_FILES["dr"].read_text(encoding="utf-8"),
+        )
 
     def test_external_replication_mode_disables_repository_sync(self) -> None:
         expected_services = {
@@ -412,10 +485,46 @@ class ComposePolicyTests(unittest.TestCase):
         self.assertIn('docker compose "$@"', preflight)
         self.assertIn("DATA_REPLICATION_MODE", preflight)
         self.assertIn("prometheusremotewrite/peer", preflight)
+        self.assertIn('deployment_mode == "dns-only"', preflight)
+        self.assertIn('{"dns-failover"}', preflight)
+        self.assertIn("DNS-only /state must be one writable named volume", preflight)
+        self.assertIn("does not contain that image", preflight)
+        self.assertIn("Full deployment mode must include otel-collector", preflight)
         self.assertIn('/run/source-otel-config/receivers.yaml', preflight)
         self.assertIn("2.24.0", preflight)
         self.assertIn("amd64", preflight)
         self.assertNotIn("required_secrets=", preflight)
+
+    def test_dns_only_transition_is_confirmed_ordered_and_volume_preserving(self) -> None:
+        helper = (ROOT / "services/activate-dns-only.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("RETIRE_REPOSITORY_STACK", helper)
+        self.assertIn('rendered_mode" != "dns-only"', helper)
+        self.assertIn('rendered_role" != "$site"', helper)
+        self.assertIn('docker compose "$@" up -d --wait', helper)
+        self.assertIn("dns-failover probe", helper)
+        self.assertIn("--force-recreate --wait", helper)
+        self.assertLess(
+            helper.index("dns-failover probe"),
+            helper.index('docker compose "$@" up -d --wait'),
+        )
+        self.assertLess(
+            helper.index('docker compose "$@" up -d --wait'),
+            helper.index("remove_service_containers otel-watcher"),
+        )
+        self.assertLess(
+            helper.index("remove_service_containers otel-watcher"),
+            helper.index("for service in otel-collector vm-sync ch-sync"),
+        )
+        self.assertIn("expected exactly one project container", helper)
+        self.assertIn('dns_oneoff" != "False"', helper)
+        self.assertIn('dns_name" != "/dns-failover"', helper)
+        self.assertIn('dns_health" != "healthy"', helper)
+        self.assertIn('docker stop "$container_id"', helper)
+        self.assertIn('docker rm "$container_id"', helper)
+        self.assertNotIn("--remove-orphans", helper)
+        self.assertNotIn("--volumes", helper)
 
     def test_external_transition_removes_old_sync_containers_without_volumes(self) -> None:
         helper = (

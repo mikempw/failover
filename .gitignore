@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+!.env.dns-only.example
 failover/.env.primary
 failover/.env.dr
 !failover/.env.primary.example

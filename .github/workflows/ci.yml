@@ -62,6 +62,15 @@ jobs:
           docker compose -f docker-compose.dr.yaml \
             -f docker-compose.external.dr.yaml config --quiet
 
+      - name: Validate DNS-only compose models and preflight
+        env:
+          DNS_ONLY_PRIMARY_HEALTH_URL: http://192.0.2.10:8080/health
+          DNS_ONLY_DR_HEALTH_URL: http://192.0.2.20:8080/ready-for-traffic
+          DNS_ONLY_PRIMARY_FAILBACK_HEALTH_URL: http://192.0.2.10:8080/recovery-ready
+        run: |
+          sh services/preflight.sh docker-compose.dns-only.primary.yaml
+          sh services/preflight.sh docker-compose.dns-only.dr.yaml
+
       - name: Build primary custom images
         run: docker compose -f docker-compose.primary.yaml build
 
@@ -78,6 +87,15 @@ jobs:
           docker compose -f docker-compose.primary.yaml
           -f docker-compose.external.primary.yaml run --rm --no-deps
           -e OTEL_CONFIG_VALIDATE_ONLY=1 otel-collector
+
+      - name: Validate DNS-only controller configurations
+        env:
+          DNS_ONLY_PRIMARY_HEALTH_URL: http://192.0.2.10:8080/health
+          DNS_ONLY_DR_HEALTH_URL: http://192.0.2.20:8080/ready-for-traffic
+          DNS_ONLY_PRIMARY_FAILBACK_HEALTH_URL: http://192.0.2.10:8080/recovery-ready
+        run: |
+          docker compose -f docker-compose.dns-only.primary.yaml run --rm --no-deps dns-failover validate
+          docker compose -f docker-compose.dns-only.dr.yaml run --rm --no-deps dns-failover validate
 
       - name: Smoke-test fresh ClickHouse and Grafana volumes
         run: >-

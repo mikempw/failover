@@ -18,6 +18,10 @@ Configuration sources (in priority order):
   1. HashiCorp Vault (if configured)
   2. Environment variables / .env file
 
+DNS-only deployment-boundary settings (role, mode, health policy, and
+automatic failback) are intentionally read directly from the Compose
+environment so Vault cannot weaken the local manifest.
+
 Environment-driven configuration for containers.
 """
 
@@ -240,6 +244,10 @@ class Config:
     # Custom Script Provider
     script_set: Optional[str] = None  # Path to script that sets DNS records
     script_get: Optional[str] = None  # Path to script that gets DNS records
+
+    # Deployment boundary.  DNS-only mode has stricter external-health rules
+    # because no repository-managed watcher or data plane is present.
+    deployment_mode: str = "full"
     
     @classmethod
     def from_env(cls):
@@ -269,6 +277,23 @@ class Config:
 
         def get_float(key: str, default: float = 0.0) -> float:
             return float(get(key, default))
+
+        deployment_mode = os.getenv('DEPLOYMENT_MODE', 'full').strip().lower()
+        role = os.getenv('ROLE', 'primary').strip().lower()
+
+        def get_boundary(key: str, default: Any = None) -> Any:
+            """Keep Compose-forced DNS-only health policy ahead of Vault."""
+            if deployment_mode == 'dns-only':
+                return os.getenv(key, default)
+            return get(key, default)
+
+        def get_boundary_bool(key: str, default: bool = False) -> bool:
+            value = str(get_boundary(key, str(default))).strip().lower()
+            if value in ('true', '1', 'yes', 'on'):
+                return True
+            if value in ('false', '0', 'no', 'off'):
+                return False
+            raise ValueError(f"{key} must be true or false")
         
         return cls(
             provider=get('DNS_PROVIDER', 'dry-run'),
@@ -281,17 +306,23 @@ class Config:
             lease_ttl=get_int('LEASE_TTL', 60),
             update_interval=get_int('UPDATE_INTERVAL', 10),
             fail_threshold=get_int('FAIL_THRESHOLD', 3),
-            health_host=get('HEALTH_HOST', '10.10.10.10'),
-            health_port=get_int('HEALTH_PORT', 6514),
-            health_timeout=get_int('HEALTH_TIMEOUT', 2),
-            health_mode=get('HEALTH_MODE', 'tcp'),
-            health_url=get('HEALTH_URL'),
-            health_metric=get('HEALTH_METRIC', 'otelcol_receiver_accepted_metric_points'),
-            health_stale_count=get_int('HEALTH_STALE_COUNT', 3),
-            role=get('ROLE', 'primary'),
-            local_health_url=get('LOCAL_HEALTH_URL'),
-            failback_health_url=get('FAILBACK_HEALTH_URL'),
-            auto_failback=get_bool('AUTO_FAILBACK', False),
+            health_host=get_boundary('HEALTH_HOST', '10.10.10.10'),
+            health_port=int(get_boundary('HEALTH_PORT', 6514)),
+            health_timeout=int(get_boundary('HEALTH_TIMEOUT', 2)),
+            health_mode=get_boundary('HEALTH_MODE', 'tcp'),
+            health_url=get_boundary('HEALTH_URL'),
+            health_metric=get_boundary(
+                'HEALTH_METRIC', 'otelcol_receiver_accepted_metric_points'
+            ),
+            health_stale_count=int(get_boundary('HEALTH_STALE_COUNT', 3)),
+            # These two values define the local deployment boundary rather
+            # than a secret.  Read the Compose-forced values directly so
+            # Vault cannot silently turn a DR controller into primary or
+            # disable DNS-only guardrails.
+            role=role,
+            local_health_url=get_boundary('LOCAL_HEALTH_URL'),
+            failback_health_url=get_boundary('FAILBACK_HEALTH_URL'),
+            auto_failback=get_boundary_bool('AUTO_FAILBACK', False),
             failback_threshold=get_int('FAILBACK_THRESHOLD', 3),
             max_clock_skew=get_int('MAX_CLOCK_SKEW', 5),
             retry_max=get_int('DNS_RETRY_MAX', 60),
@@ -331,6 +362,7 @@ class Config:
             f5_dr_member=get('F5_DR_MEMBER'),
             script_set=get('SCRIPT_SET'),
             script_get=get('SCRIPT_GET'),
+            deployment_mode=deployment_mode,
         )
     
     def validate(self):
@@ -339,6 +371,12 @@ class Config:
         
         if self.role not in ['primary', 'dr']:
             errors.append(f"Invalid ROLE: {self.role}")
+
+        if self.deployment_mode not in ('full', 'dns-only'):
+            errors.append(
+                f"Invalid DEPLOYMENT_MODE: {self.deployment_mode}. "
+                "Valid: full, dns-only"
+            )
         
         if self.provider not in VALID_PROVIDERS:
             errors.append(f"Invalid DNS_PROVIDER: {self.provider}. Valid: {', '.join(VALID_PROVIDERS)}")
@@ -510,6 +548,65 @@ class Config:
                 errors.append("FAILBACK_HEALTH_URL must be an absolute http or https URL")
         if self.auto_failback and not self.failback_health_url:
             errors.append("FAILBACK_HEALTH_URL is required when AUTO_FAILBACK is enabled")
+
+        if self.deployment_mode == 'dns-only':
+            if self.health_mode != 'http':
+                errors.append("HEALTH_MODE must be http in dns-only mode")
+            if self.role == 'dr' and not self.local_health_url:
+                errors.append(
+                    "LOCAL_HEALTH_URL is required for DR in dns-only mode"
+                )
+            if not self.failback_health_url:
+                errors.append(
+                    "FAILBACK_HEALTH_URL is required in dns-only mode"
+                )
+
+            # DNS-only probes must address each site directly.  Following the
+            # managed record would make a failed primary appear healthy after
+            # that same record has moved to DR.  Compose-local names are also
+            # invalid because those services do not exist in this mode.
+            forbidden_hosts = {
+                self.dns_record.rstrip('.').lower(),
+                'localhost',
+                'otel-collector',
+                'victoriametrics',
+                'clickhouse',
+                'grafana',
+                'application-study-tool-otel-collector-1',
+            }
+            health_targets = []
+            if self.health_mode in ('http', 'metrics') and self.health_url:
+                health_targets.append(
+                    ('HEALTH_URL', urllib.parse.urlsplit(self.health_url).hostname)
+                )
+            elif self.health_mode == 'tcp':
+                health_targets.append(('HEALTH_HOST', self.health_host))
+            for setting, url in (
+                ('LOCAL_HEALTH_URL', self.local_health_url),
+                ('FAILBACK_HEALTH_URL', self.failback_health_url),
+            ):
+                if url:
+                    health_targets.append(
+                        (setting, urllib.parse.urlsplit(url).hostname)
+                    )
+
+            for setting, hostname in health_targets:
+                normalized = (hostname or '').rstrip('.').lower()
+                if normalized in forbidden_hosts:
+                    errors.append(
+                        f"{setting} must target an external site-specific "
+                        "endpoint in dns-only mode"
+                    )
+                    continue
+                try:
+                    address = ipaddress.ip_address(normalized)
+                except ValueError:
+                    continue
+                if address.is_loopback or address.is_unspecified:
+                    errors.append(
+                        f"{setting} must target an external site-specific "
+                        "endpoint in dns-only mode"
+                    )
         
         if self.lease_ttl <= self.update_interval:
             errors.append(f"LEASE_TTL ({self.lease_ttl}) must be > UPDATE_INTERVAL ({self.update_interval})")
@@ -1657,6 +1754,38 @@ def show_dns(cfg: Config, provider: DNSProvider):
         'time_remaining': lease.expires_at - now_unix(),
     }, indent=2))
 
+
+def probe_dns_only_health(cfg: Config) -> None:
+    """Require every external DNS-only gate to return HTTP 2xx once."""
+    if cfg.deployment_mode != 'dns-only':
+        raise ValueError("The probe command is available only in dns-only mode")
+    targets = [('primary availability', cfg.health_url)]
+    if cfg.local_health_url:
+        targets.append(('DR readiness', cfg.local_health_url))
+    targets.append(('primary recovery', cfg.failback_health_url))
+
+    failed = []
+    for label, url in targets:
+        if not url or not check_http(url, cfg.health_timeout):
+            failed.append(label)
+        else:
+            log(f"External {label} probe passed")
+    if failed:
+        raise RuntimeError(
+            "External DNS-only health probe failed: " + ", ".join(failed)
+        )
+
+
+def probe_dns_only_dr_readiness(cfg: Config) -> None:
+    """Check only DR readiness when primary failure is already expected."""
+    if cfg.deployment_mode != 'dns-only' or cfg.role != 'dr':
+        raise ValueError("The probe-dr command requires the DNS-only DR role")
+    if not cfg.local_health_url or not check_http(
+        cfg.local_health_url, cfg.health_timeout
+    ):
+        raise RuntimeError("External DNS-only DR readiness probe failed")
+    log("External DR readiness probe passed")
+
 # -----------------------------
 # Heartbeat Loops
 # -----------------------------
@@ -2000,7 +2129,16 @@ def heartbeat_dr(
 
 def main():
     parser = argparse.ArgumentParser(description='AST DNS Failover')
-    parser.add_argument('command', nargs='?', default='run', choices=['run', 'init', 'promote', 'failback', 'show', 'validate'], help='Command to execute')
+    parser.add_argument(
+        'command',
+        nargs='?',
+        default='run',
+        choices=[
+            'run', 'init', 'promote', 'failback', 'show', 'validate',
+            'probe', 'probe-dr',
+        ],
+        help='Command to execute',
+    )
     parser.add_argument('--once', action='store_true', help='Run one heartbeat iteration and exit')
     args = parser.parse_args()
     
@@ -2010,13 +2148,29 @@ def main():
         try:
             cfg.validate()
             print("Configuration valid")
-            print(json.dumps({'role': cfg.role, 'provider': cfg.provider, 'dns_record': cfg.dns_record, 'primary_ip': cfg.primary_ip, 'dr_ip': cfg.dr_ip}, indent=2))
+            print(json.dumps({
+                'deployment_mode': cfg.deployment_mode,
+                'role': cfg.role,
+                'provider': cfg.provider,
+                'dns_record': cfg.dns_record,
+                'primary_ip': cfg.primary_ip,
+                'dr_ip': cfg.dr_ip,
+            }, indent=2))
             sys.exit(0)
         except ValueError as e:
             print(f"Configuration invalid: {e}")
             sys.exit(1)
     
     cfg.validate()
+    if args.command == 'probe':
+        probe_dns_only_health(cfg)
+        print("External DNS-only health probes passed")
+        return
+    if args.command == 'probe-dr':
+        probe_dns_only_dr_readiness(cfg)
+        print("External DNS-only DR readiness probe passed")
+        return
+
     provider = build_provider(cfg)
     
     if args.command == 'init':

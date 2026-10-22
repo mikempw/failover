@@ -1,6 +1,11 @@
 # Operator guide
 
-This guide covers secure deployment, normal operations, failover, and recovery. Run the primary and DR Compose files on separate Linux/amd64 hosts with Docker Compose v2.24 or newer; the manifests use `env_file.required`, and the pinned upstream AST collector image is not available for arm64.
+This guide covers secure deployment, normal operations, failover, and recovery.
+Run the primary and DR roles on separate hosts with Docker Compose v2.24 or
+newer; the manifests use `env_file.required`. The full and
+external-replication stacks require Linux/amd64 because the pinned upstream
+AST collector is not available for arm64. The standalone DNS-only controller
+does not include that collector.
 
 ## Operating model
 
@@ -17,6 +22,196 @@ The TXT value has the form `owner=primary exp=UNIX_TIME` or `owner=dr exp=UNIX_T
 An opt-in external-replication overlay replaces the three cross-site data
 paths with local-only ingestion. It does not change DNS ownership or collector
 fencing, and it does not add a replication-completeness check.
+
+An independent DNS-only model runs just the lease controller. It does not run
+or fence any application or data component. Use the following runbook for that
+model; the later storage, collector, synchronization, and recovery procedures
+apply only to the full or external-replication stacks.
+
+## DNS-only control plane runbook
+
+### Scope and external contract
+
+`docker-compose.dns-only.primary.yaml` and
+`docker-compose.dns-only.dr.yaml` each render exactly one `dns-failover`
+service. They force their own `ROLE` and `DEPLOYMENT_MODE=dns-only`, retain the
+site's existing failover-state volume, and mount only provider secrets and
+custom DNS scripts. They contain no watcher, Docker socket, collector,
+VictoriaMetrics, ClickHouse, Grafana, synchronization service, application
+secret, or published port.
+
+The controller still uses the same coherent A + TXT lease algorithm. DR can
+promote only after repeated primary failures and lease expiry plus clock skew;
+it must also receive HTTP 2xx from its external DR-readiness endpoint. What
+changes is the ownership boundary:
+
+- The external platform owns WireGuard, data copy, lag/RPO monitoring,
+  reverse recovery, application lifecycle, and single-writer fencing.
+- This repository owns only the managed DNS A/TXT records.
+- The controller trusts configured HTTP 2xx responses. It does not examine
+  data, WireGuard state, response bodies, or replication epochs.
+- DNS TTL is not a connection drain. Cached clients can continue reaching the
+  old address, so external fencing must tolerate that overlap.
+
+The fixed `dns-failover` container name means primary and DR are intended for
+separate hosts. Run exactly one controller per role and keep reliable time
+synchronization enabled on both.
+
+### Configure each host
+
+Create a small root Compose environment and one role-specific controller file:
+
+```sh
+cp .env.dns-only.example .env
+
+# Primary host
+cp failover/.env.primary.example .env.primary
+
+# DR host instead
+# cp failover/.env.dr.example .env.dr
+
+mkdir -p secrets/failover
+chmod 700 secrets secrets/failover
+```
+
+Replace every TEST-NET address and `example.test` value. In `.env.primary` or
+`.env.dr`, configure `DNS_PROVIDER`, the zone/record, primary and DR IPs,
+lease timing, and provider-specific settings. Store secret values in private
+files under `secrets/failover` and reference them with `NAME_FILE=/secrets/name`
+where supported.
+
+Root `.env` supplies host-side Compose interpolation, not controller
+`env_file` values. Configure:
+
+- `DNS_ONLY_PRIMARY_HEALTH_URL`: direct primary availability URL. Both roles
+  use it; it must not resolve through the managed `DNS_RECORD`.
+- `DNS_ONLY_DR_HEALTH_URL`: direct DR traffic-readiness URL. DR must return 2xx
+  before promotion and while it renews ownership.
+- `DNS_ONLY_PRIMARY_FAILBACK_HEALTH_URL`: separate direct primary recovery
+  gate. The primary uses it before reclaiming from DR. If automatic failback
+  is enabled, DR also uses it before yielding.
+- `FAILOVER_SECRETS_DIR`: host provider-secret directory.
+
+The recovery URL is intentionally distinct from normal primary health. It may
+be backed by an external adapter that verifies restored data and fencing, but
+the repository cannot tell whether it does. Keep `AUTO_FAILBACK=false` unless
+that contract is trustworthy.
+
+### Validate and start a fresh deployment
+
+On primary, validate configuration and all external gates used by that role,
+then create
+the initial lease once:
+
+```sh
+sh services/preflight.sh docker-compose.dns-only.primary.yaml
+docker compose -f docker-compose.dns-only.primary.yaml build --pull
+docker compose -f docker-compose.dns-only.primary.yaml run --rm --no-deps \
+  dns-failover validate
+docker compose -f docker-compose.dns-only.primary.yaml run --rm --no-deps \
+  dns-failover probe
+docker compose -f docker-compose.dns-only.primary.yaml run --rm --no-deps \
+  dns-failover init
+sh services/activate-dns-only.sh primary
+```
+
+`init` writes immediately, so run it only after verifying the target record,
+both addresses, and externally managed primary readiness. On DR, do not run
+`init`:
+
+```sh
+sh services/preflight.sh docker-compose.dns-only.dr.yaml
+docker compose -f docker-compose.dns-only.dr.yaml build --pull
+docker compose -f docker-compose.dns-only.dr.yaml run --rm --no-deps \
+  dns-failover validate
+docker compose -f docker-compose.dns-only.dr.yaml run --rm --no-deps \
+  dns-failover probe
+sh services/activate-dns-only.sh dr
+```
+
+For a fresh deployment or full-stack transition, activation repeats the
+non-writing `probe` inside a one-off controller container, starts the
+controller, and waits for Compose health. A controller's
+`/readyz` reflects a recent successful loop iteration, not ownership or data
+completeness. On DR while primary is healthy, that loop does not exercise the
+DR-local or failback URL; the explicit `probe` covers those endpoints once at
+activation, and the loop checks each gate again when its ownership phase needs
+it. An idempotent restart of an existing DNS-only project skips the all-gates
+probe because primary availability and recovery are expected to fail during a
+real outage; the controller still enforces the gate appropriate to its current
+lease phase. If a DR controller must be created from scratch during an active
+primary outage, the explicit
+`DNS_ONLY_SKIP_PROBE=START_DURING_OUTAGE` override skips only the one-shot
+all-gates probe and instead runs `probe-dr`, which still requires the direct DR
+readiness URL to return 2xx. The override is rejected for the primary role.
+DNS-only validation and normal failover gates still apply.
+
+### Migrate a running repository stack
+
+A standalone `docker compose -f docker-compose.dns-only.*.yaml up -d` does not
+remove containers created by the old full manifest. In particular, a leftover
+`otel-watcher` can continue manipulating the collector. Use the activation
+helper.
+
+First move all data-plane responsibility outside this Compose project and
+confirm the external endpoints are ready. Preserve the original Compose
+project identity. If the old deployment used `-p` or `COMPOSE_PROJECT_NAME`,
+pass the same `-p` option; replacing root `.env` may otherwise drop that value:
+
+```sh
+# Prepare the DNS controller image before changing the running lease or stack.
+docker compose -f docker-compose.dns-only.primary.yaml build --pull
+
+# Discover the current project name if needed.
+docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' \
+  dns-failover
+
+# Example primary transition with the default project name.
+DNS_ONLY_CONFIRM=RETIRE_REPOSITORY_STACK \
+  sh services/activate-dns-only.sh primary
+
+# Example when the existing project used a custom name.
+DNS_ONLY_CONFIRM=RETIRE_REPOSITORY_STACK \
+  sh services/activate-dns-only.sh primary -p ast-primary-custom
+```
+
+Use `dr` on the DR host. The helper validates the exact one-service model,
+refuses a fixed-name container owned by a different project, probes all
+configured external gates, and establishes a healthy DNS-only controller
+before touching the old stack. With the confirmation present, it stops the
+Docker-socket watcher first, retires writers and storage, then removes every
+other same-project non-DNS or one-off container—including services added by a
+local override—and preserves named volumes. It then force-recreates the
+controller from a fresh readiness state and requires exactly one healthy,
+running, non-one-off `dns-failover` container in the project.
+
+Without `DNS_ONLY_CONFIRM=RETIRE_REPOSITORY_STACK`, any old non-DNS or one-off
+container makes activation fail without changing it. The confirmation removes
+containers and interrupts the old repository data plane; it does not delete
+named volumes. Do not give that confirmation until the external owner has
+taken over.
+
+### Operate and switch
+
+Inspect the authoritative lease with a disposable read-only command:
+
+```sh
+docker compose -f docker-compose.dns-only.primary.yaml run --rm --no-deps \
+  dns-failover show
+docker compose -f docker-compose.dns-only.primary.yaml ps
+docker compose -f docker-compose.dns-only.primary.yaml logs dns-failover
+```
+
+Use the matching DR manifest on that host. Also monitor the authoritative A
+and TXT answers, lease-owner/expiry metrics, the external replication system,
+and both sites' fencing state. Do not interpret `/readyz` as proof that this
+site owns DNS or that its data is current.
+
+Normal automatic failover should be preferred. Manual `promote` and `failback`
+write the lease immediately; `init` overwrites it with primary ownership. All
+three commands bypass failure thresholds, lease-expiry waits, and health
+checks. Treat them as break-glass DNS changes and independently verify the
+external data/fencing contract first.
 
 ## Prepare each site
 

@@ -1,0 +1,39 @@
+name: ast-primary
+
+x-failover-env: &failover-env
+  - path: ./failover/.env.primary.example
+    required: true
+  - path: ./.env.primary
+    required: false
+  - path: ./failover/.env.primary
+    required: false
+
+volumes:
+  primary_failover_state:
+
+services:
+  dns-failover:
+    build:
+      context: .
+      dockerfile: failover/Dockerfile
+    image: dns-failover
+    container_name: dns-failover
+    restart: unless-stopped
+    env_file: *failover-env
+    environment:
+      ROLE: primary
+      DEPLOYMENT_MODE: dns-only
+      HEALTH_MODE: http
+      HEALTH_URL: ${DNS_ONLY_PRIMARY_HEALTH_URL:?Set DNS_ONLY_PRIMARY_HEALTH_URL}
+      LOCAL_HEALTH_URL: ""
+      FAILBACK_HEALTH_URL: ${DNS_ONLY_PRIMARY_FAILBACK_HEALTH_URL:?Set DNS_ONLY_PRIMARY_FAILBACK_HEALTH_URL}
+    volumes:
+      - primary_failover_state:/state
+      - ${FAILOVER_SECRETS_DIR:-./secrets/failover}:/run/source-secrets:ro
+      - ./scripts:/run/source-scripts:ro
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/readyz' % os.getenv('STATUS_PORT', '8080'), timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s

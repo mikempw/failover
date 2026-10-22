@@ -4,8 +4,9 @@
 
 This repository implements active/passive AST collection across a primary and DR site. DNS is the control plane: a single A record selects the active collector, and a TXT record carries an expiring ownership lease. The design favors fail-closed behavior over availability when control-plane state is ambiguous.
 
-The supplied deployment targets Linux/amd64. Its pinned upstream AST collector
-image does not provide an arm64 variant.
+The full and external-replication deployments target Linux/amd64 because the
+pinned upstream AST collector image has no arm64 variant. The standalone
+DNS-only deployment does not include that image and applies no amd64 gate.
 
 This is not an active/active database system, a distributed consensus implementation, or a backup product. It coordinates collector activity and provides best-effort cross-site repair for VictoriaMetrics and ClickHouse.
 
@@ -361,6 +362,104 @@ DR ingestion without changing DNS.
 
 The synchronizer does not detect same-row-count content differences, alter existing schemas, remove destination-only partitions, or replicate non-MergeTree tables. Validate those cases separately.
 
+## DNS-only control-plane mode
+
+DNS-only mode is a separate deployment model, not a profile or overlay on the
+application stack. `docker-compose.dns-only.primary.yaml` and
+`docker-compose.dns-only.dr.yaml` each render exactly one service:
+`dns-failover`. The manifests force `ROLE` to the matching site and set
+`DEPLOYMENT_MODE=dns-only`. They reuse the full deployment's project name and
+site failover-state volume so a controlled migration preserves provider
+observation state.
+
+The service has one writable named `/state` volume and two read-only bind
+mounts for provider secrets and custom scripts. It has no Docker socket,
+published port, dependency, application Docker secret, custom data-plane
+network, watcher, collector, database, dashboard, or synchronization process.
+The managed A/TXT lease state machine is otherwise unchanged.
+
+### External readiness contract
+
+The manifests force HTTP health mode and require three Compose substitutions:
+
+| Setting | Consumer | Meaning |
+|---|---|---|
+| `DNS_ONLY_PRIMARY_HEALTH_URL` | both roles | Direct primary availability used by primary renewal and DR failure detection. |
+| `DNS_ONLY_DR_HEALTH_URL` | DR | Direct DR traffic readiness required before promotion and while DR renews. |
+| `DNS_ONLY_PRIMARY_FAILBACK_HEALTH_URL` | both roles | Separate primary recovery gate used for reclamation and optional automatic failback. |
+
+All targets must be absolute site-specific HTTP(S) URLs. Configuration rejects
+the moving `DNS_RECORD`, loopback, and known Compose-local service names. DR
+cannot start in DNS-only mode without `LOCAL_HEALTH_URL`, and both roles require
+the recovery URL. `HEALTH_MODE` must remain `http`.
+
+`ROLE`, `DEPLOYMENT_MODE`, the three health URLs, health mode/timing, and
+`AUTO_FAILBACK` are deployment-boundary values in DNS-only mode. They are read
+directly from the Compose environment instead of Vault, so a stale Vault entry
+cannot change the role, disable the stricter mode, redirect a gate, or enable
+automatic failback. DNS/provider settings and credentials retain the normal
+Vault/file/environment precedence.
+
+The `probe` command performs one non-writing HTTP check against every external
+gate present on that role. For a fresh deployment or full-stack transition,
+`services/activate-dns-only.sh` runs it in a temporary `--rm` controller
+container. An idempotent DNS-only restart skips that all-gates probe because
+failed primary endpoints are expected during an outage; a fresh DR start can
+use the exact `DNS_ONLY_SKIP_PROBE=START_DURING_OUTAGE` override, which replaces
+the all-gates probe with a mandatory DR-local `probe-dr`. The override is
+invalid for primary. The long-running controller later checks the gate for its current state: for example, DR does
+not call its local readiness URL while a healthy primary owns the lease.
+`/readyz` therefore means a recent successful control iteration, not that all
+three external gates are currently healthy, that the local site owns DNS, or
+that data is complete.
+
+### Transition invariants
+
+Compose does not remove services omitted by a different manifest. The
+activation helper enforces the transition as follows:
+
+1. Render and preflight the exact one-service DNS-only model.
+2. Require the rendered role and deployment mode to match the requested site.
+3. Refuse a fixed-name `dns-failover` container owned by another Compose
+   project.
+4. Detect every same-project container other than the canonical non-one-off
+   controller. If any exists, require the exact
+   `DNS_ONLY_CONFIRM=RETIRE_REPOSITORY_STACK` confirmation.
+5. Run the non-writing external health probe from the prebuilt controller
+   image. Image preparation occurs before lease initialization or migration.
+6. Recreate the DNS-only controller and wait for health before changing old
+   containers.
+7. Stop the Docker-socket watcher first, then known writers/synchronizers,
+   dashboards, and storage. Remove any remaining same-project non-DNS or
+   one-off container without deleting named volumes.
+8. Force-recreate the controller to clear readiness learned while the old
+   stack was present, wait again, and assert that the canonical, healthy,
+   running, non-one-off controller is the project's only container.
+
+The confirmation applies to every same-project non-DNS container, including
+operator-added override services; the helper displays the retirement set
+before requiring confirmation. Operators must preserve any original `-p` or
+`COMPOSE_PROJECT_NAME` identity when invoking the helper.
+
+Preflight is service-aware. It applies the amd64 restriction and OTel receiver
+and secret checks only when a collector is rendered, while full mode still
+requires that collector. DNS-only preflight instead enforces the sole service,
+mount cardinality/types, absence of Docker secrets/socket/ports/dependencies,
+and provider-secret directory.
+
+### Safety boundary
+
+This mode has no proof of WireGuard state, replication direction, lag, RPO,
+data equality, application writability, or external fencing. A provider or
+network partition can allow DR to promote after lease expiry while the old
+primary application remains alive. DNS caches can continue sending clients to
+the former address after the authoritative change. Those risks must be handled
+by the external platform. `AUTO_FAILBACK=false` remains the safe default.
+
+Manual `init`, `promote`, and `failback` are unchanged break-glass writes: they
+bypass health, failure-count, and lease-expiry gates. The dedicated manifests
+reduce the deployed component set; they do not make those commands safer.
+
 ## External replication mode
 
 External mode is selected only by explicitly merging the appropriate external
@@ -460,11 +559,15 @@ These settings are read by Compose from root `.env`:
 | `OTEL_BOOTSTRAP_CHECK_INTERVAL` | Seconds between bootstrap DNS checks. |
 | `OTEL_BOOTSTRAP_DNS_SERVER` | Optional resolver reachable from the collector container. |
 | `FAILOVER_SECRETS_DIR` | Provider-only host directory bind-mounted read-only for `dns-failover`; `.env.example` uses `./secrets/failover`, and the secure entrypoint stages its files into private runtime `/secrets`. |
+| `DNS_ONLY_PRIMARY_HEALTH_URL` | Required direct primary availability URL for the standalone DNS-only manifests. |
+| `DNS_ONLY_DR_HEALTH_URL` | Required direct DR traffic-readiness URL for the DNS-only DR manifest. |
+| `DNS_ONLY_PRIMARY_FAILBACK_HEALTH_URL` | Required direct primary recovery gate, intentionally separate from ordinary availability. |
 
 ### DNS controller settings
 
 | Setting | Default | Purpose |
 |---|---:|---|
+| `DEPLOYMENT_MODE` | `full` | `full` or `dns-only`; dedicated manifests force the latter and enable stricter external-health validation. |
 | `ROLE` | `primary` | `primary` or `dr`. |
 | `DNS_PROVIDER` | `dry-run` | Provider implementation. |
 | `DNS_SERVER` | `127.0.0.1` | Provider/query server where applicable; watcher fallback input. |
@@ -481,13 +584,18 @@ These settings are read by Compose from root `.env`:
 | `WRITE_VERIFY_ATTEMPTS` | 3 | Read-after-write attempts. |
 | `WRITE_VERIFY_DELAY` | 0.5 | Delay between verification reads. |
 | `LEASE_PROOF_FILE` | `/state/observed-lease.json` | Atomic local copy of the last coherent provider A/TXT observation shared with collector fencing. |
-| `HEALTH_MODE` | `tcp` in code | `tcp`, `http`, or `metrics`; examples use `http`. |
+| `HEALTH_MODE` | `tcp` in code | `tcp`, `http`, or `metrics`; DNS-only manifests force and validate `http`. |
 | `HEALTH_TIMEOUT` | 2 | Health request timeout. |
-| `LOCAL_HEALTH_URL` | unset | Optional DR-local 2xx readiness URL. |
-| `FAILBACK_HEALTH_URL` | unset in code | Role-specific HTTP(S) recovery URL used while DR owns the lease: primary uses its local value before reclaiming, while DR uses its separately configured DR-visible value only with `AUTO_FAILBACK=true` before yielding. Enabling automatic failback requires the value at validation. |
+| `LOCAL_HEALTH_URL` | unset | Optional DR-local 2xx readiness URL in full mode; required for DR in DNS-only mode. |
+| `FAILBACK_HEALTH_URL` | unset in code | Role-specific HTTP(S) recovery URL used while DR owns the lease: primary uses its local value before reclaiming, while DR uses its separately configured DR-visible value only with `AUTO_FAILBACK=true` before yielding. DNS-only mode always requires the value; full mode requires it when automatic failback is enabled. |
 | `STATUS_PORT` | 8080 | Status server port. |
 
-The code supports `NAME_FILE` for any configuration key. Set either `NAME` or `NAME_FILE`, never both. Vault values take precedence over file and environment values. `VAULT_REQUIRED=true` converts Vault loading failure into a startup error; otherwise the loader warns and falls back.
+The code supports `NAME_FILE` for configuration keys. Set either `NAME` or
+`NAME_FILE`, never both. Vault normally takes precedence over file and
+environment values. In DNS-only mode, role, mode, health-policy, and automatic
+failback settings are deliberate exceptions and come directly from the
+Compose environment. `VAULT_REQUIRED=true` converts Vault loading failure into
+a startup error; otherwise the loader warns and falls back.
 
 ### Provider settings
 
@@ -639,11 +747,19 @@ sh services/preflight.sh -f docker-compose.primary.yaml -f docker-compose.extern
 sh services/preflight.sh -f docker-compose.dr.yaml -f docker-compose.external.dr.yaml
 docker compose -f docker-compose.primary.yaml -f docker-compose.external.primary.yaml config --quiet
 docker compose -f docker-compose.dr.yaml -f docker-compose.external.dr.yaml config --quiet
+
+# Standalone DNS-only variants (requires the DNS_ONLY_* URLs in root .env)
+sh services/preflight.sh docker-compose.dns-only.primary.yaml
+sh services/preflight.sh docker-compose.dns-only.dr.yaml
+docker compose -f docker-compose.dns-only.primary.yaml config --quiet
+docker compose -f docker-compose.dns-only.dr.yaml config --quiet
 ```
 
-`services/preflight.sh` additionally enforces Docker Compose 2.24 or newer, an
-amd64 Docker server, readable application secret files, dedicated OTel and DNS
-provider secret-directory mounts, and one receiver-file bind.
+`services/preflight.sh` additionally enforces Docker Compose 2.24 or newer.
+Models containing the collector require an amd64 Docker server, readable
+application secrets, dedicated OTel/provider secret directories, and one
+receiver-file bind. DNS-only models instead require the exact one-service
+boundary, its single persistent state volume, and provider-only bind mounts.
 
 Build validation requires a running Docker daemon:
 
@@ -654,7 +770,8 @@ docker compose -f docker-compose.dr.yaml pull victoriametrics clickhouse
 docker compose -f docker-compose.dr.yaml build --pull
 ```
 
-The unit suite covers lease validation and failback behavior, watcher
+The unit suite covers lease validation and failback behavior, DNS-only
+configuration/mount/health boundaries, watcher
 resolver/reconciliation failures, setup-secret externalization, durable
 VictoriaMetrics watermarks and retries, ClickHouse staging/replacement safety,
 direction-aware destination fencing, and recovery confirmation behavior.
