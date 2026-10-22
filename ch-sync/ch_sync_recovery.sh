@@ -1,36 +1,29 @@
-#!/bin/bash
-#
-# ClickHouse Recovery Sync
-# Pulls missing data from DR to Primary (append-only, no deletes)
-#
-# Usage: ./ch_sync_recovery.sh
+#!/bin/sh
+# Run an explicitly configured, one-shot reverse synchronization for recovery.
+set -eu
 
-SOURCE="192.168.100.143"  # DR
-DEST="192.168.100.144"    # Primary
-DB="ast"
+RECOVERY_CONFIRMATION=REPLACE_DESTINATION_PARTITIONS
 
-echo "Syncing from DR ($SOURCE) to Primary ($DEST)"
+if [ "${CH_SYNC_RECOVERY_CONFIRM:-}" != "$RECOVERY_CONFIRMATION" ]; then
+    echo "Refusing recovery sync." >&2
+    echo "Set SOURCE_HOST/DEST_HOST and CH_SYNC_RECOVERY_CONFIRM=REPLACE_DESTINATION_PARTITIONS." >&2
+    exit 2
+fi
 
-# Get tables
-TABLES=$(curl -s "http://${SOURCE}:8123/?query=SHOW+TABLES+FROM+${DB}" | tr '\n' ' ')
+: "${SOURCE_HOST:?SOURCE_HOST must identify the recovery source}"
+: "${DEST_HOST:?DEST_HOST must identify the recovery destination}"
+: "${DNS_RECORD:?DNS_RECORD must identify the failover DNS record}"
+: "${PRIMARY_IP:?PRIMARY_IP must identify the recovery destination address}"
+: "${SYNC_GUARD_LEASE_PROOF_FILE:?SYNC_GUARD_LEASE_PROOF_FILE must identify the observed lease proof}"
 
-for TABLE in $TABLES; do
-    [ -z "$TABLE" ] && continue
-    echo "Syncing $DB.$TABLE..."
-    
-    # Get max timestamp from destination (what we already have)
-    MAX_TS=$(curl -s "http://${DEST}:8123/" \
-        --data-urlencode "query=SELECT max(TimeUnix) FROM ${DB}.${TABLE}" 2>/dev/null | tr -d '\n')
-    
-    if [ -z "$MAX_TS" ] || [ "$MAX_TS" = "0" ]; then
-        echo "  No existing data, pulling all..."
-        curl -s "http://${DEST}:8123/" \
-            --data-urlencode "query=INSERT INTO ${DB}.${TABLE} SELECT * FROM remote('${SOURCE}:9000', '${DB}.${TABLE}', 'default', '')"
-    else
-        echo "  Pulling data after $MAX_TS..."
-        curl -s "http://${DEST}:8123/" \
-            --data-urlencode "query=INSERT INTO ${DB}.${TABLE} SELECT * FROM remote('${SOURCE}:9000', '${DB}.${TABLE}', 'default', '') WHERE TimeUnix > ${MAX_TS}"
-    fi
-done
+echo "WARNING: reverse sync can replace destination partitions." >&2
+echo "Run it only while DNS still points to DR and primary OTEL ingestion is stopped." >&2
 
-echo "Done"
+# Recovery reverses the source and destination, so fence the primary address.
+# The human confirmation does not bypass DNS/lease-proof verification.
+export SYNC_GUARD_DNS_RECORD="${SYNC_GUARD_DNS_RECORD:-$DNS_RECORD}"
+export SYNC_GUARD_DEST_IP="${SYNC_GUARD_DEST_IP:-$PRIMARY_IP}"
+unset SYNC_ALLOW_ACTIVE_DESTINATION
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec python3 "$SCRIPT_DIR/ch_sync.py" --once

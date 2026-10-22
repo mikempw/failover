@@ -1,13 +1,25 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-trixie
 
-# Install DNS tools and Docker CLI
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    dnsutils \
-    curl \
-    && curl -fsSL https://get.docker.com | sh \
+ARG DOCKER_CLI_VERSION=26.1.5+dfsg1-9+deb13u1
+
+# Install only the resolver tools and Debian's pinned Docker client.  The
+# watcher talks to the explicitly mounted host socket; no daemon is installed.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        dnsutils \
+        docker-cli="${DOCKER_CLI_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
-COPY otel_watcher_docker.py /app/
+COPY common/ /app/common/
+COPY failover/otel_watcher_docker.py /app/otel_watcher_docker.py
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD python3 -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.getenv('STATUS_PORT', '8080') + '/readyz', timeout=2)"
 
 CMD ["python3", "/app/otel_watcher_docker.py"]

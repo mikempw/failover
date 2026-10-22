@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile Python sources
+        run: python -m compileall -q common failover vm-sync ch-sync tests
+
+      - name: Check shell syntax
+        shell: bash
+        run: |
+          while IFS= read -r -d '' script; do
+            case "$(head -n 1 "$script")" in
+              *bash*) bash -n "$script" ;;
+              *) sh -n "$script" ;;
+            esac
+          done < <(git ls-files -z '*.sh')
+
+      - name: Run unit and deployment-policy tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Create ephemeral compose secrets
+        shell: bash
+        run: |
+          umask 077
+          openssl rand -base64 32 | tr -d '\n' > secrets/clickhouse_password.txt
+          openssl rand -base64 32 | tr -d '\n' > secrets/grafana_clickhouse_password.txt
+          openssl rand -base64 32 | tr -d '\n' > secrets/primary_clickhouse_password.txt
+          openssl rand -base64 32 | tr -d '\n' > secrets/grafana_admin_password.txt
+
+      - name: Validate primary compose model
+        run: docker compose -f docker-compose.primary.yaml config --quiet
+
+      - name: Validate DR compose model
+        run: docker compose -f docker-compose.dr.yaml config --quiet
+
+      - name: Build primary custom images
+        run: docker compose -f docker-compose.primary.yaml build
+
+      - name: Build DR synchronization image
+        run: docker compose -f docker-compose.dr.yaml build ch-sync
+
+      - name: Validate collector config and staged-file permissions
+        run: >-
+          docker compose -f docker-compose.primary.yaml run --rm --no-deps
+          -e OTEL_CONFIG_VALIDATE_ONLY=1 otel-collector
+
+      - name: Smoke-test fresh ClickHouse and Grafana volumes
+        run: >-
+          docker compose -f docker-compose.primary.yaml up -d --wait
+          --wait-timeout 240 clickhouse grafana
+
+      - name: Clean up smoke-test containers and volumes
+        if: always()
+        run: >-
+          docker compose -f docker-compose.primary.yaml down --volumes
+          --remove-orphans

@@ -1,17 +1,12 @@
-# pipelines.yaml
-#
-# OTEL pipelines for dual-site metrics delivery
-# Place in: services/otel_collector/pipelines.yaml
-
 metrics:
   receivers:
     - bigip
   processors:
     - batch/local
   exporters:
-    - prometheusremotewrite/primary   # → Primary VictoriaMetrics
-    - prometheusremotewrite/dr        # → DR VictoriaMetrics
-    - clickhouse                      # → ClickHouse (synced via ch-sync)
+    - prometheusremotewrite/local
+    - prometheusremotewrite/peer
+    - clickhouse
 
 metrics/f5-datafabric:
   receivers:
@@ -23,9 +18,12 @@ metrics/f5-datafabric:
   exporters:
     - otlp/f5-datafabric
 
+# The BIG-IP scraper is metrics-only. The included OTLP receiver preserves
+# local ClickHouse ingestion for applications sending logs or traces to 4317
+# or 4318 without creating invalid BIG-IP signal pipelines.
 logs:
   receivers:
-    - bigip
+    - otlp
   processors:
     - batch/local
   exporters:
@@ -33,7 +31,7 @@ logs:
 
 traces:
   receivers:
-    - bigip
+    - otlp
   processors:
     - batch/local
   exporters:

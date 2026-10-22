@@ -1,0 +1,8 @@
+* text=auto
+
+# These files are parsed or executed inside Linux containers. Keep their line
+# endings deterministic even when the repository is checked out on Windows.
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
