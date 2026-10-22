@@ -21,6 +21,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install DNS provider dependencies
+        run: python -m pip install --disable-pip-version-check -r failover/requirements.txt
+
       - name: Compile Python sources
         run: python -m compileall -q common failover vm-sync ch-sync tests
 
