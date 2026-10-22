@@ -75,8 +75,8 @@ if [ "${OTEL_SECRETS_STAGED:-}" != "1" ]; then
     /bin/busybox cp "$receivers_source" /run/runtime-config/receivers.yaml
     /bin/busybox chown -R 10001:0 /run/runtime-secrets
     /bin/busybox chown -R 10001:0 /run/runtime-config
-    /bin/busybox find /run/runtime-secrets -type d -exec chmod 0700 {} +
-    /bin/busybox find /run/runtime-secrets -type f -exec chmod 0400 {} +
+    /bin/busybox find /run/runtime-secrets -type d -exec /bin/busybox chmod 0700 {} +
+    /bin/busybox find /run/runtime-secrets -type f -exec /bin/busybox chmod 0400 {} +
     /bin/busybox chmod 0500 /run/runtime-config
     /bin/busybox chmod 0400 /run/runtime-config/receivers.yaml
     unset clickhouse_password clickhouse_secret otel_secret_source receivers_source

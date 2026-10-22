@@ -135,6 +135,8 @@ class ComposePolicyTests(unittest.TestCase):
         self.assertIn("stable_count=$((stable_count + 1))", gate)
         self.assertIn("OTEL_SECRETS_STAGED", gate)
         self.assertIn("drop-privileges 10001 0", gate)
+        self.assertNotIn("-exec chmod", gate)
+        self.assertIn("-exec /bin/busybox chmod", gate)
         self.assertIn("/run/runtime-config/receivers.yaml", gate)
         self.assertIn("OTEL_CONFIG_VALIDATE_ONLY", gate)
         self.assertIn('exec /otelcol-custom "$@"', gate)
