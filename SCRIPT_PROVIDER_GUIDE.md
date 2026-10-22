@@ -1,578 +1,286 @@
-# Custom Script Provider Guide
+# Custom DNS script provider
 
-Your DNS provider isn't built-in? No problem. The `script` provider lets you integrate **any** DNS system using two simple scripts.
+Use `DNS_PROVIDER=script` when the DNS backend is not supported directly. The failover service delegates updates and reads to two executable programs while retaining the same strict lease validation, read-after-write verification, health gates, and retry behavior used by built-in providers.
 
----
+No deployment-specific scripts are committed. The setup wizard generates templates under the ignored root `scripts/` directory, and both Compose stacks mount that directory read-only at `/scripts`.
 
-## Overview
+## Configuration
 
-You create two scripts:
+In both `.env.primary` and `.env.dr`:
 
-| Script | Purpose | When called |
-|--------|---------|-------------|
-| `set_dns.sh` | Update DNS records | Every heartbeat (primary) or on failover (DR) |
-| `get_dns.sh` | Query current DNS state | DR checking if it should take over |
-
-These can be written in **any language**: bash, python, powershell, ruby, go, etc.
-
----
-
-## Quick Start
-
-### 1. Create your scripts directory
-
-```bash
-mkdir -p /opt/dns-failover/scripts
-cd /opt/dns-failover/scripts
-```
-
-### 2. Create set_dns.sh
-
-```bash
-#!/bin/bash
-# Receives: $1=record $2=ip $3=owner $4=expiry $5=ttl $6=zone
-# Must: Update A record and TXT record
-# Exit: 0=success, non-zero=failure
-
-RECORD="$1"
-IP="$2"
-OWNER="$3"
-EXPIRY="$4"
-TTL="$5"
-ZONE="$6"
-
-# YOUR CODE HERE - call your DNS API
-# Example:
-# curl -X PUT "https://your-dns/api/record" -d '{"name":"'$RECORD'","ip":"'$IP'"}'
-
-exit 0
-```
-
-### 3. Create get_dns.sh
-
-```bash
-#!/bin/bash
-# Receives: $1=record $2=zone
-# Must: Output JSON to stdout
-# Exit: 0=success, non-zero=failure
-
-RECORD="$1"
-
-# YOUR CODE HERE - query your DNS
-# Must output this exact JSON format:
-echo '{"A": "10.10.10.10", "TXT": "owner=primary exp=1699567890"}'
-
-exit 0
-```
-
-### 4. Make executable
-
-```bash
-chmod +x set_dns.sh get_dns.sh
-```
-
-### 5. Configure .env
-
-```bash
+```dotenv
 DNS_PROVIDER=script
 SCRIPT_SET=/scripts/set_dns.sh
 SCRIPT_GET=/scripts/get_dns.sh
 ```
 
-### 6. Run with scripts mounted
+The remaining common settings must match across sites:
 
-```bash
-docker run -d --name dns-failover \
-  --env-file .env \
-  -v /opt/dns-failover/scripts:/scripts \
-  dns-failover
+```dotenv
+DNS_ZONE=example.com
+DNS_RECORD=ast-failover.example.com
+DNS_TTL=30
+PRIMARY_IP=192.0.2.10
+DR_IP=192.0.2.20
 ```
 
----
+Use `ROLE=primary` at primary and `ROLE=dr` at DR.
 
-## Script Interface Reference
+Generate starting templates from the repository root:
 
-### set_dns.sh
-
-**Called when:** DNS needs to be updated (heartbeat renewal or failover)
-
-**Arguments (positional):**
-
-| Position | Variable | Example | Description |
-|----------|----------|---------|-------------|
-| $1 | RECORD | syslog.example.com | FQDN to update |
-| $2 | IP | 10.10.10.10 | IP address to set |
-| $3 | OWNER | primary | Who owns the lease (primary or dr) |
-| $4 | EXPIRY | 1699567890 | Unix timestamp when lease expires |
-| $5 | TTL | 30 | DNS TTL in seconds |
-| $6 | ZONE | example.com | DNS zone |
-
-**Environment variables (same data, alternative access):**
-
-```bash
-$DNS_RECORD    # syslog.example.com
-$DNS_IP        # 10.10.10.10
-$DNS_OWNER     # primary
-$DNS_EXPIRY    # 1699567890
-$DNS_TTL       # 30
-$DNS_ZONE      # example.com
-$DNS_SERVER    # (if configured)
+```sh
+python -m pip install -r failover/requirements.txt
+python failover/setup.py
 ```
 
-**What it must do:**
-1. Set/update A record: `RECORD → IP`
-2. Set/update TXT record: `RECORD → "owner=OWNER exp=EXPIRY"`
+Select the custom-script provider and accept `.` as the output directory. The wizard writes `.env.primary`, `.env.dr`, `scripts/set_dns.sh`, and `scripts/get_dns.sh`. The generated set script deliberately refuses to succeed until it is customized. The generated get script uses `dig` as a starting point.
 
-**Exit codes:**
-- `0` = Success
-- Non-zero = Failure (will be logged, retried next interval)
+Review all generated files and keep them out of version control.
 
----
+## Set contract
 
-### get_dns.sh
+The service calls:
 
-**Called when:** DR needs to check current DNS state
-
-**Arguments (positional):**
-
-| Position | Variable | Example | Description |
-|----------|----------|---------|-------------|
-| $1 | RECORD | syslog.example.com | FQDN to query |
-| $2 | ZONE | example.com | DNS zone |
-
-**Environment variables:**
-
-```bash
-$DNS_RECORD    # syslog.example.com
-$DNS_ZONE      # example.com
-$DNS_SERVER    # (if configured)
+```text
+SCRIPT_SET RECORD IP OWNER EXPIRY_UNIX TTL ZONE
 ```
 
-**What it must output (stdout):**
+Positional arguments are:
+
+| Position | Meaning | Example |
+|---:|---|---|
+| `$1` | Managed FQDN | `ast-failover.example.com` |
+| `$2` | New IPv4 address | `192.0.2.20` |
+| `$3` | Lease owner | `primary` or `dr` |
+| `$4` | Lease expiry as Unix seconds | `1792688400` |
+| `$5` | DNS TTL in seconds | `30` |
+| `$6` | DNS zone | `example.com` |
+
+The same values are provided as environment variables:
+
+```text
+DNS_RECORD DNS_IP DNS_OWNER DNS_EXPIRY DNS_TTL DNS_ZONE DNS_SERVER
+```
+
+The set program must update both records:
+
+```text
+RECORD A   IP
+RECORD TXT "owner=OWNER exp=EXPIRY_UNIX"
+```
+
+Return 0 only after the provider accepted both updates. Return nonzero for any partial or uncertain outcome and put a concise diagnostic on stderr. Standard output is ignored.
+
+The subprocess timeout is 30 seconds. If an API can remain asynchronous beyond that time, the script should poll its authoritative state within the deadline or return failure and let the controller retry.
+
+### Atomicity and ordering
+
+Use a transactional record-set update whenever the backend supports one. If it cannot update A and TXT atomically, write the new TXT lease first and the A record last. This lets controllers reject the temporary owner/address mismatch and delays the collector-visible A switch until the ownership metadata has been written.
+
+The service re-reads the exact intended owner, address, and expiry after every successful set call. It retries readback according to `WRITE_VERIFY_ATTEMPTS` and `WRITE_VERIFY_DELAY`; a set program must not treat an unverifiable write as complete.
+
+## Get contract
+
+The service calls:
+
+```text
+SCRIPT_GET RECORD ZONE
+```
+
+It also provides:
+
+```text
+DNS_RECORD DNS_ZONE DNS_SERVER
+```
+
+On success, print exactly one JSON object to stdout:
 
 ```json
-{"A": "10.10.10.10", "TXT": "owner=primary exp=1699567890"}
+{"A":"192.0.2.10","TXT":"owner=primary exp=1792688400"}
 ```
 
-**If records don't exist:**
+When neither record exists, return:
 
 ```json
-{"A": null, "TXT": null}
+{"A":null,"TXT":null}
 ```
 
-**Exit codes:**
-- `0` = Success (even if records don't exist)
-- Non-zero = Failure (will be logged as warning)
+Requirements:
 
----
+- Use the authoritative provider/API where possible, not a stale recursive cache.
+- Return one IPv4 A value, never a comma-separated list.
+- Preserve the TXT content as `owner=<role> exp=<integer>`.
+- Escape JSON correctly.
+- Write logs only to stderr; extra stdout makes the JSON invalid.
+- Return nonzero when the result is partial, stale, ambiguous, or unavailable.
 
-## Examples
+The get subprocess also has a 30-second timeout. Nonzero exit, timeout, invalid JSON, missing fields, an invalid owner/expiry, or an address/owner mismatch becomes an unreadable lease. Continuous failover then fails closed: primary does not renew from uncertain state and DR does not promote.
 
-### PowerDNS
+## Minimal script shape
 
-```bash
-#!/bin/bash
-# set_dns.sh for PowerDNS
+Use a strict shell mode and validate every input before calling the provider:
 
-RECORD="$1"
-IP="$2"
-OWNER="$3"
-EXPIRY="$4"
-TTL="$5"
-ZONE="$6"
+```sh
+#!/bin/sh
+set -eu
 
-API="http://powerdns.local:8081/api/v1"
-KEY="your-api-key"
+record=$1
+ip=$2
+owner=$3
+expiry=$4
+ttl=$5
+zone=$6
 
-# Update A record
-curl -s -X PATCH "$API/servers/localhost/zones/$ZONE." \
-  -H "X-API-Key: $KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "rrsets": [{
-      "name": "'$RECORD'.",
-      "type": "A",
-      "ttl": '$TTL',
-      "changetype": "REPLACE",
-      "records": [{"content": "'$IP'", "disabled": false}]
-    }]
-  }'
+case "$owner" in
+  primary|dr) ;;
+  *) echo "invalid owner" >&2; exit 2 ;;
+esac
 
-# Update TXT record
-curl -s -X PATCH "$API/servers/localhost/zones/$ZONE." \
-  -H "X-API-Key: $KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "rrsets": [{
-      "name": "'$RECORD'.",
-      "type": "TXT",
-      "ttl": '$TTL',
-      "changetype": "REPLACE",
-      "records": [{"content": "\"owner='$OWNER' exp='$EXPIRY'\"", "disabled": false}]
-    }]
-  }'
-
-exit 0
+# Replace this block with one transactional provider update, or TXT first and
+# A last. Exit nonzero if either operation is uncertain.
+echo "set_dns.sh has not been implemented" >&2
+exit 1
 ```
 
-```bash
-#!/bin/bash
-# get_dns.sh for PowerDNS
+Do not leave a placeholder that exits 0. A false success is more dangerous than a visible deployment failure.
 
-RECORD="$1"
-ZONE="$2"
+The script can be POSIX shell, Python, or another executable whose interpreter is installed in the `dns-failover` image. The stock image includes `/bin/sh`, Python, `dig`, and `nsupdate`; it does not include every language runtime or vendor CLI. Extend `failover/Dockerfile` deliberately if your integration needs one.
 
-API="http://powerdns.local:8081/api/v1"
-KEY="your-api-key"
+## Credentials
 
-# Get zone data
-DATA=$(curl -s "$API/servers/localhost/zones/$ZONE." -H "X-API-Key: $KEY")
+Do not embed credentials in the script or failover environment file. Put them
+under the configured host secrets directory and reference the staged container
+path, for example:
 
-# Extract A record
-A_RECORD=$(echo "$DATA" | jq -r '.rrsets[] | select(.name=="'$RECORD'." and .type=="A") | .records[0].content')
-
-# Extract TXT record
-TXT_RECORD=$(echo "$DATA" | jq -r '.rrsets[] | select(.name=="'$RECORD'." and .type=="TXT") | .records[0].content' | tr -d '"')
-
-# Output JSON
-[ -z "$A_RECORD" ] && A_RECORD="null" || A_RECORD="\"$A_RECORD\""
-[ -z "$TXT_RECORD" ] && TXT_RECORD="null" || TXT_RECORD="\"$TXT_RECORD\""
-
-echo "{\"A\": $A_RECORD, \"TXT\": $TXT_RECORD}"
+```dotenv
+PROVIDER_TOKEN_FILE=/secrets/custom_dns_token
 ```
 
----
+The copied `.env` defaults `FAILOVER_SECRETS_DIR` to
+`./secrets/failover`; only that provider-specific directory is mounted into
+the controller bootstrap.
 
-### BlueCat Address Manager
+Then read that file in the script. The child process inherits the failover environment, so never dump the entire environment to logs.
 
-```bash
-#!/bin/bash
-# set_dns.sh for BlueCat
+Host provider-secret files may remain operator-owned mode `0600`. The
+`dns-failover` bootstrap stages the read-only secrets and scripts into private
+in-container paths before permanently dropping to `appuser`; do not make the
+host secret world-readable. Scripts must still have executable mode and must
+not contain embedded credentials.
 
-RECORD="$1"
-IP="$2"
-OWNER="$3"
-EXPIRY="$4"
-TTL="$5"
-ZONE="$6"
+If the wizard collects a recognized sensitive field, it creates a private file and emits the corresponding `_FILE` setting. For an arbitrary custom variable, create and permission the file yourself.
 
-# Login and get token
-TOKEN=$(curl -s -X POST "https://$BLUECAT_HOST/Services/REST/v1/login" \
-  -d "username=$BLUECAT_USER&password=$BLUECAT_PASS" | jq -r '.apiToken')
+Recommended host setup:
 
-# Get configuration ID (adjust for your setup)
-CONFIG_ID="$BLUECAT_CONFIG_ID"
-
-# Add/update host record
-curl -s -X PUT "https://$BLUECAT_HOST/Services/REST/v1/addHostRecord" \
-  -H "Authorization: BAMAuthToken: $TOKEN" \
-  -d "configurationId=$CONFIG_ID&absoluteName=$RECORD&addresses=$IP&ttl=$TTL"
-
-# Add TXT record for lease tracking
-curl -s -X PUT "https://$BLUECAT_HOST/Services/REST/v1/addTXTRecord" \
-  -H "Authorization: BAMAuthToken: $TOKEN" \
-  -d "configurationId=$CONFIG_ID&absoluteName=$RECORD&txt=owner=$OWNER exp=$EXPIRY"
-
-# Logout
-curl -s -X POST "https://$BLUECAT_HOST/Services/REST/v1/logout" \
-  -H "Authorization: BAMAuthToken: $TOKEN"
-
-exit 0
+```sh
+umask 077
+mkdir -p secrets/failover
+chmod 700 secrets secrets/failover
+printf '%s' 'replace-with-real-token' > secrets/failover/custom_dns_token
+chmod 755 scripts/set_dns.sh scripts/get_dns.sh
 ```
 
----
+Compose mounts `./scripts` read-only. The scripts themselves cannot modify that directory at runtime.
 
-### Windows DNS (PowerShell)
+## Test before enabling automation
 
-```powershell
-# set_dns.ps1 for Windows DNS Server
+Use a delegated test record or test zone.
 
-param(
-    [string]$Record,
-    [string]$IP,
-    [string]$Owner,
-    [string]$Expiry,
-    [int]$TTL,
-    [string]$Zone
-)
+### 1. Test get output
 
-$DnsServer = $env:DNS_SERVER
-
-# Extract hostname from FQDN
-$Hostname = $Record -replace "\.$Zone$", ""
-
-# Remove existing records
-Remove-DnsServerResourceRecord -ZoneName $Zone -Name $Hostname -RRType A -Force -ErrorAction SilentlyContinue
-Remove-DnsServerResourceRecord -ZoneName $Zone -Name $Hostname -RRType TXT -Force -ErrorAction SilentlyContinue
-
-# Add A record
-Add-DnsServerResourceRecord -ZoneName $Zone -Name $Hostname -A -IPv4Address $IP -TimeToLive (New-TimeSpan -Seconds $TTL)
-
-# Add TXT record
-Add-DnsServerResourceRecord -ZoneName $Zone -Name $Hostname -Txt -DescriptiveText "owner=$Owner exp=$Expiry" -TimeToLive (New-TimeSpan -Seconds $TTL)
-
-exit 0
+```sh
+./scripts/get_dns.sh ast-failover.example.com example.com | python -m json.tool
 ```
 
-```powershell
-# get_dns.ps1 for Windows DNS Server
+Confirm stdout contains only JSON and errors go to stderr.
 
-param(
-    [string]$Record,
-    [string]$Zone
-)
+### 2. Test a manual update
 
-$Hostname = $Record -replace "\.$Zone$", ""
-
-try {
-    $A = (Get-DnsServerResourceRecord -ZoneName $Zone -Name $Hostname -RRType A -ErrorAction Stop).RecordData.IPv4Address.ToString()
-} catch {
-    $A = $null
-}
-
-try {
-    $TXT = (Get-DnsServerResourceRecord -ZoneName $Zone -Name $Hostname -RRType TXT -ErrorAction Stop).RecordData.DescriptiveText
-} catch {
-    $TXT = $null
-}
-
-# Output JSON
-$result = @{
-    A = $A
-    TXT = $TXT
-} | ConvertTo-Json -Compress
-
-Write-Output $result
+```sh
+expiry=$(( $(date +%s) + 300 ))
+./scripts/set_dns.sh \
+  ast-failover.example.com 192.0.2.10 primary "$expiry" 30 example.com
+./scripts/get_dns.sh ast-failover.example.com example.com | python -m json.tool
 ```
 
-**Wrapper for PowerShell scripts (bash):**
+Verify A and TXT through the provider's authoritative API as well as DNS.
 
-```bash
-#!/bin/bash
-# set_dns.sh - wrapper for PowerShell
+### 3. Validate inside the deployment image
 
-pwsh /scripts/set_dns.ps1 -Record "$1" -IP "$2" -Owner "$3" -Expiry "$4" -TTL "$5" -Zone "$6"
+Host execution does not prove that `/scripts`, interpreters, permissions, and secret paths work in the container. Run:
+
+```sh
+docker compose -f docker-compose.primary.yaml pull victoriametrics clickhouse
+docker compose -f docker-compose.primary.yaml build --pull
+docker compose -f docker-compose.primary.yaml run --rm --no-deps dns-failover validate
+
+docker compose -f docker-compose.dr.yaml pull victoriametrics clickhouse
+docker compose -f docker-compose.dr.yaml build --pull
+docker compose -f docker-compose.dr.yaml run --rm --no-deps dns-failover validate
 ```
 
----
+Validation requires both container paths to exist and be executable.
 
-### Python Example (Generic REST API)
+### 4. Prepare storage, initialize, and start
 
-```python
-#!/usr/bin/env python3
-# set_dns.py - Generic REST API example
+Only after the manual tests pass:
 
-import sys
-import os
-import requests
-
-def main():
-    record = sys.argv[1]
-    ip = sys.argv[2]
-    owner = sys.argv[3]
-    expiry = sys.argv[4]
-    ttl = sys.argv[5]
-    zone = sys.argv[6]
-    
-    api_url = os.environ['DNS_API_URL']
-    api_key = os.environ['DNS_API_KEY']
-    
-    headers = {
-        'Authorization': f'Bearer {api_key}',
-        'Content-Type': 'application/json'
-    }
-    
-    # Update A record
-    requests.put(
-        f'{api_url}/zones/{zone}/records/{record}/A',
-        headers=headers,
-        json={'value': ip, 'ttl': int(ttl)}
-    ).raise_for_status()
-    
-    # Update TXT record
-    requests.put(
-        f'{api_url}/zones/{zone}/records/{record}/TXT',
-        headers=headers,
-        json={'value': f'owner={owner} exp={expiry}', 'ttl': int(ttl)}
-    ).raise_for_status()
-
-if __name__ == '__main__':
-    main()
+```sh
+docker compose -f docker-compose.primary.yaml up -d --no-deps --wait \
+  --wait-timeout 300 victoriametrics clickhouse
+docker compose -f docker-compose.primary.yaml run --rm --no-deps dns-failover init
+docker compose -f docker-compose.primary.yaml up -d
+docker compose -f docker-compose.primary.yaml exec dns-failover \
+  python3 /app/dns_failover.py show
 ```
 
----
+The first command starts only storage and waits for its health checks; the
+collector and both control services remain stopped. `init` then performs a
+real DNS write. Start the already-built, prepulled full stack immediately and
+only then read back the lease. It must show the primary address, primary owner,
+and a future expiry. Do not add a pull or build after `init`: if the short
+initial lease expires past its skew allowance, primary intentionally refuses
+an automatic renewal that could race DR promotion.
 
-### Using dig (Fallback for get_dns.sh)
+### 5. Observe and start DR
 
-If your DNS is standard and queryable, this works for most setups:
-
-```bash
-#!/bin/bash
-# get_dns.sh - Universal using dig
-
-RECORD="$1"
-SERVER="${DNS_SERVER:-}"
-
-if [ -n "$SERVER" ]; then
-    DIG_ARGS="@$SERVER"
-else
-    DIG_ARGS=""
-fi
-
-# Query A record
-A_RECORD=$(dig $DIG_ARGS +short "$RECORD" A 2>/dev/null | head -1)
-
-# Query TXT record  
-TXT_RECORD=$(dig $DIG_ARGS +short "$RECORD" TXT 2>/dev/null | tr -d '"' | head -1)
-
-# Format as JSON
-if [ -z "$A_RECORD" ]; then
-    A_JSON="null"
-else
-    A_JSON="\"$A_RECORD\""
-fi
-
-if [ -z "$TXT_RECORD" ]; then
-    TXT_JSON="null"
-else
-    TXT_JSON="\"$TXT_RECORD\""
-fi
-
-echo "{\"A\": $A_JSON, \"TXT\": $TXT_JSON}"
-exit 0
+```sh
+docker compose -f docker-compose.primary.yaml logs -f dns-failover otel-watcher
 ```
 
----
+Start DR only after primary is healthy. Prestart its storage without controls or
+ingestion, wait for health, and then start the remaining services:
 
-## Passing Credentials
-
-**Option 1: Environment variables in .env**
-
-```bash
-# .env
-DNS_PROVIDER=script
-SCRIPT_SET=/scripts/set_dns.sh
-SCRIPT_GET=/scripts/get_dns.sh
-
-# Your custom credentials (available in scripts as $VAR)
-BLUECAT_HOST=bluecat.company.local
-BLUECAT_USER=admin
-BLUECAT_PASS=secret123
+```sh
+docker compose -f docker-compose.dr.yaml up -d --no-deps --wait \
+  --wait-timeout 300 victoriametrics clickhouse
+docker compose -f docker-compose.dr.yaml up -d
 ```
 
-**Option 2: Mount a secrets file**
+Confirm the DR watcher keeps its collector stopped while DNS points to primary.
 
-```bash
-docker run -d \
-  -v /opt/secrets/dns-creds.env:/secrets/dns-creds.env \
-  dns-failover
-```
+## Failure behavior
 
-In your script:
-```bash
-source /secrets/dns-creds.env
-```
+| Script outcome | Controller behavior |
+|---|---|
+| Set exits nonzero | Write fails; loop reports failure and backs off. |
+| Set times out | Write fails; the next loop must re-read before retrying. |
+| Set exits 0 but readback differs | Write is rejected as unverifiable. |
+| Get exits nonzero | Lease becomes unreadable; no promotion. |
+| Get prints invalid JSON | Lease becomes unreadable; no promotion. |
+| Get returns only A or only TXT | Lease is incomplete; no promotion. |
+| Get returns wrong owner/address pair | Lease is incoherent; no promotion. |
 
-**Option 3: Use Vault**
+## Production checklist
 
-Configure Vault integration in .env, and your credentials will be loaded automatically.
-
----
-
-## Testing Your Scripts
-
-### Test set_dns.sh
-
-```bash
-# Run manually
-./set_dns.sh test.example.com 10.10.10.10 primary 9999999999 30 example.com
-
-# Check your DNS to verify it worked
-dig test.example.com A
-dig test.example.com TXT
-```
-
-### Test get_dns.sh
-
-```bash
-# Run manually
-./get_dns.sh test.example.com example.com
-
-# Should output:
-# {"A": "10.10.10.10", "TXT": "owner=primary exp=9999999999"}
-```
-
-### Validate JSON output
-
-```bash
-./get_dns.sh test.example.com example.com | jq .
-```
-
-### Test in container
-
-```bash
-docker run --rm -it \
-  -v $(pwd)/scripts:/scripts \
-  -e DNS_PROVIDER=script \
-  -e SCRIPT_SET=/scripts/set_dns.sh \
-  -e SCRIPT_GET=/scripts/get_dns.sh \
-  dns-failover python3 /app/dns_failover.py validate
-```
-
----
-
-## Troubleshooting
-
-### Script not found
-
-```
-Configuration errors: SCRIPT_SET not found: /scripts/set_dns.sh
-```
-
-**Fix:** Check volume mount and path.
-
-### Script not executable
-
-```
-Configuration errors: SCRIPT_SET not executable: /scripts/set_dns.sh
-```
-
-**Fix:** `chmod +x /path/to/script.sh`
-
-### Invalid JSON from get_dns.sh
-
-```
-SCRIPT_GET returned invalid JSON
-```
-
-**Fix:** Ensure your script outputs valid JSON. Test with `| jq .`
-
-### Timeout
-
-```
-SCRIPT_GET timed out
-```
-
-**Fix:** Scripts have 30s timeout. Optimize or increase network timeout in your API calls.
-
----
-
-## Best Practices
-
-1. **Keep scripts simple** - Do one thing: update or query DNS
-2. **Handle errors** - Exit non-zero on failure
-3. **Log to stderr** - Use `echo "message" >&2` for debugging (stdout is for JSON output in get_dns.sh)
-4. **Test locally first** - Verify scripts work before deploying
-5. **Use environment variables** - Don't hardcode credentials
-6. **Set timeouts** - Add timeouts to API calls to prevent hangs
-
----
-
-## Need Help?
-
-If you're stuck:
-
-1. Test scripts manually first
-2. Check container logs: `docker logs dns-failover`
-3. Validate with: `python3 /app/dns_failover.py validate`
-4. Open an issue with your DNS provider details
+- [ ] Scripts use absolute container paths and executable shebangs.
+- [ ] A and TXT are updated atomically, or TXT is written before A.
+- [ ] Get reads authoritative state and emits one JSON object.
+- [ ] Exactly one A value is managed.
+- [ ] Provider authentication follows least privilege.
+- [ ] Secrets are files, not source code, arguments, or log output.
+- [ ] API requests verify TLS certificates.
+- [ ] Errors and partial outcomes return nonzero.
+- [ ] Both containerized `validate` commands pass.
+- [ ] `init` readback is coherent before either full stack starts.
+- [ ] Failover, DNS propagation, and reverse recovery have been rehearsed in a test zone.

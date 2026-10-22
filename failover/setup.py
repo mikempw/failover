@@ -8,6 +8,8 @@ import os
 import sys
 import json
 import getpass
+import re
+import tempfile
 
 # ANSI colors
 GREEN = '\033[92m'
@@ -290,6 +292,9 @@ def setup_gcp(config):
     
     config['GCP_PROJECT_ID'] = ask("Project ID")
     config['GCP_MANAGED_ZONE'] = ask("Managed Zone Name (not the DNS name)")
+    config['GCP_CHANGE_TIMEOUT'] = ask(
+        "Maximum seconds to wait for a DNS change", default="30"
+    )
     
     use_file = ask_bool("Use credentials file? (No = use Application Default Credentials)", default=True)
     if use_file:
@@ -309,9 +314,17 @@ def setup_f5(config):
     config['F5_PARTITION'] = ask("Partition", default="Common")
     config['F5_VERIFY_SSL'] = "true" if ask_bool("Verify SSL certificate?", default=True) else "false"
     
-    use_pool = ask_bool("Do you have a GTM pool to manage?", default=False)
-    if use_pool:
-        config['F5_POOL_NAME'] = ask("GTM Pool Name")
+    config['F5_POOL_NAME'] = ask("GTM A Pool Name")
+    print_info(
+        "Use the exact fullPath values returned by the pool members API; "
+        "the pool must contain only these two members"
+    )
+    config['F5_PRIMARY_MEMBER'] = ask(
+        "Primary GTM member fullPath (for example /Common/server-primary:/Common/vs)"
+    )
+    config['F5_DR_MEMBER'] = ask(
+        "DR GTM member fullPath (for example /Common/server-dr:/Common/vs)"
+    )
 
 def setup_infoblox(config):
     """Setup Infoblox provider."""
@@ -403,6 +416,7 @@ def setup_script(config, output_dir):
     IP="$2"
     OWNER="$3"
     EXPIRY="$4"
+    BLUECAT_TOKEN="$(cat "${BLUECAT_TOKEN_FILE:?missing BLUECAT_TOKEN_FILE}")"
     
     # Call BlueCat API (example - adjust for your setup)
     curl -X PUT "https://bluecat.company.local/api/v2/records/$RECORD" \\
@@ -440,6 +454,7 @@ def setup_script(config, output_dir):
     # get_dns.sh - Query BlueCat DNS
     
     RECORD="$1"
+    BLUECAT_TOKEN="$(cat "${BLUECAT_TOKEN_FILE:?missing BLUECAT_TOKEN_FILE}")"
     
     # Get A record
     A_RECORD=$(curl -s "https://bluecat.company.local/api/v2/records/$RECORD" \\
@@ -511,6 +526,8 @@ echo "Updating DNS: $RECORD -> $IP (owner=$OWNER, exp=$EXPIRY)" >&2
 
 # Example: Using curl to call a REST API
 # 
+# YOUR_API_TOKEN="$(cat "${YOUR_API_TOKEN_FILE:?missing YOUR_API_TOKEN_FILE}")"
+#
 # curl -X PUT "https://your-dns-provider.local/api/records/$RECORD" \\
 #   -H "Authorization: Bearer $YOUR_API_TOKEN" \\
 #   -H "Content-Type: application/json" \\
@@ -605,6 +622,8 @@ ZONE="$2"
 
 # Example: Using curl to call a REST API
 #
+# YOUR_API_TOKEN="$(cat "${YOUR_API_TOKEN_FILE:?missing YOUR_API_TOKEN_FILE}")"
+#
 # RESPONSE=$(curl -s "https://your-dns-provider.local/api/records/$RECORD" \\
 #   -H "Authorization: Bearer $YOUR_API_TOKEN")
 # 
@@ -661,67 +680,145 @@ exit 0
     print(f"  docker run -v $(pwd)/scripts:/scripts ...")
     print()
     
-    # Optional: Ask about environment variables they might need
-    print("If your scripts need API tokens or credentials, you can add them to your .env file.")
-    print("They'll be available as environment variables in your scripts.")
+    # Optional: collect custom credentials into private mounted files.
+    print("If your scripts need API tokens or credentials, add them as secret files.")
+    print("The environment exposes only KEY_FILE=/secrets/key; scripts must read that file.")
     print()
     
-    add_vars = ask_bool("Do you want to add custom environment variables for your scripts?", default=False)
+    add_vars = ask_bool("Do you want to add custom secret files for your scripts?", default=False)
     if add_vars:
         print()
-        print("Enter your custom variables (e.g., BLUECAT_TOKEN=abc123)")
-        print("Press Enter with empty input when done.")
+        print("Enter secret variable names (e.g., BLUECAT_TOKEN).")
+        print("Press Enter with an empty name when done.")
         print()
         while True:
-            var = input("Variable (KEY=value): ").strip()
-            if not var:
+            key = input("Secret name (KEY): ").strip().upper()
+            if not key:
                 break
-            if '=' in var:
-                key, value = var.split('=', 1)
-                config[key.upper()] = value
-                print_success(f"Added {key.upper()}")
-            else:
-                print_error("Format must be KEY=value")
+            if not re.fullmatch(r'[A-Z][A-Z0-9_]*', key) or key.endswith('_FILE'):
+                print_error("Name must use A-Z, 0-9, and underscore and must not end in _FILE")
+                continue
+            value = ask(f"Value for {key}", password=True)
+            SENSITIVE_KEYS.add(key)
+            config[key] = value
+            print_success(f"Added {key}_FILE")
+
+SENSITIVE_KEYS = {
+    'CLOUDFLARE_API_TOKEN',
+    'AWS_SECRET_ACCESS_KEY',
+    'AZURE_CLIENT_SECRET',
+    'F5_PASSWORD',
+    'INFOBLOX_PASSWORD',
+    'VAULT_TOKEN',
+    'VAULT_SECRET_ID',
+}
+
+
+def _atomic_private_write(filename, contents):
+    """Atomically write a mode-0600 file."""
+    directory = os.path.dirname(os.path.abspath(filename))
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(prefix='.setup-', dir=directory, text=True)
+    try:
+        os.chmod(temporary_path, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, filename)
+        os.chmod(filename, 0o600)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def externalize_secrets(config, output_dir):
+    """Move entered credentials to ignored files mounted at /secrets."""
+    result = config.copy()
+    secrets_dir = os.path.join(output_dir, 'secrets', 'failover')
+
+    credentials_path = result.get('GCP_CREDENTIALS_FILE')
+    if credentials_path:
+        try:
+            with open(credentials_path, 'r', encoding='utf-8') as handle:
+                credentials_json = handle.read()
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(
+                f"Cannot read GCP credentials JSON file {credentials_path!r}: {exc}"
+            ) from exc
+
+        try:
+            credentials = json.loads(credentials_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"GCP credentials file {credentials_path!r} is not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(credentials, dict):
+            raise ValueError("GCP credentials JSON must contain an object")
+
+        credentials_name = 'gcp_credentials.json'
+        _atomic_private_write(
+            os.path.join(secrets_dir, credentials_name), credentials_json
+        )
+        result['GCP_CREDENTIALS_FILE'] = f'/secrets/{credentials_name}'
+
+    for key in sorted(SENSITIVE_KEYS):
+        value = result.pop(key, None)
+        if not value:
+            continue
+        secret_name = key.lower()
+        _atomic_private_write(os.path.join(secrets_dir, secret_name), str(value))
+        result[f'{key}_FILE'] = f'/secrets/{secret_name}'
+    return result
+
 
 def write_env_file(config, filename):
-    """Write configuration to .env file."""
-    with open(filename, 'w') as f:
-        f.write("# AST DNS Failover Configuration\n")
-        f.write(f"# Generated by setup wizard\n\n")
-        
-        # Group settings
-        groups = {
-            'Core': ['ROLE', 'DNS_PROVIDER', 'DNS_SERVER', 'DNS_ZONE', 'DNS_RECORD', 'DNS_TTL'],
-            'Failover': ['PRIMARY_IP', 'DR_IP', 'LEASE_TTL', 'UPDATE_INTERVAL', 'FAIL_THRESHOLD'],
-            'Health Check': ['HEALTH_HOST', 'HEALTH_PORT', 'HEALTH_TIMEOUT'],
-            'Cloudflare': ['CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ZONE_ID'],
-            'AWS Route53': ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_REGION', 'ROUTE53_ZONE_ID'],
-            'Azure DNS': ['AZURE_SUBSCRIPTION_ID', 'AZURE_RESOURCE_GROUP', 'AZURE_TENANT_ID', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET'],
-            'GCP DNS': ['GCP_PROJECT_ID', 'GCP_CREDENTIALS_FILE', 'GCP_MANAGED_ZONE'],
-            'F5 GTM': ['F5_HOST', 'F5_USERNAME', 'F5_PASSWORD', 'F5_PARTITION', 'F5_VERIFY_SSL', 'F5_POOL_NAME'],
-            'Infoblox': ['INFOBLOX_HOST', 'INFOBLOX_USERNAME', 'INFOBLOX_PASSWORD', 'INFOBLOX_WAPI_VERSION', 'INFOBLOX_VERIFY_SSL'],
-            'BIND': ['TSIG_KEYFILE'],
-            'Custom Script': ['SCRIPT_SET', 'SCRIPT_GET'],
-            'Vault': ['VAULT_ADDR', 'VAULT_AUTH_METHOD', 'VAULT_ROLE_ID', 'VAULT_SECRET_ID', 'VAULT_MOUNT', 'VAULT_KEY'],
-        }
-        
-        written = set()
-        for group, keys in groups.items():
-            group_values = [(k, config.get(k)) for k in keys if config.get(k)]
-            if group_values:
-                f.write(f"# {group}\n")
-                for key, value in group_values:
-                    f.write(f"{key}={value}\n")
-                    written.add(key)
-                f.write("\n")
-        
-        # Write any remaining config
-        remaining = [(k, v) for k, v in config.items() if k not in written and v]
-        if remaining:
-            f.write("# Other\n")
-            for key, value in remaining:
-                f.write(f"{key}={value}\n")
+    """Write a non-secret configuration file atomically with mode 0600."""
+    lines = []
 
+    def write(value):
+        lines.append(value)
+
+    write("# AST DNS Failover Configuration\n")
+    write("# Generated by setup wizard\n\n")
+
+    for key, value in config.items():
+        if '\n' in str(key) or '\n' in str(value) or '\r' in str(value):
+            raise ValueError(f"Configuration value {key} contains a newline")
+
+    # Group settings
+    groups = {
+        'Core': ['ROLE', 'DNS_PROVIDER', 'DNS_SERVER', 'DNS_ZONE', 'DNS_RECORD', 'DNS_TTL'],
+        'Failover': ['PRIMARY_IP', 'DR_IP', 'LEASE_TTL', 'UPDATE_INTERVAL', 'FAIL_THRESHOLD', 'AUTO_FAILBACK', 'FAILBACK_THRESHOLD', 'MAX_CLOCK_SKEW', 'LEASE_PROOF_FILE'],
+        'Health Check': ['HEALTH_MODE', 'HEALTH_HOST', 'HEALTH_PORT', 'HEALTH_URL', 'FAILBACK_HEALTH_URL', 'HEALTH_METRIC', 'HEALTH_STALE_COUNT', 'HEALTH_TIMEOUT', 'LOCAL_HEALTH_URL'],
+        'Cloudflare': ['CLOUDFLARE_API_TOKEN_FILE', 'CLOUDFLARE_ZONE_ID'],
+        'AWS Route53': ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY_FILE', 'AWS_REGION', 'ROUTE53_ZONE_ID'],
+        'Azure DNS': ['AZURE_SUBSCRIPTION_ID', 'AZURE_RESOURCE_GROUP', 'AZURE_TENANT_ID', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET_FILE'],
+        'GCP DNS': ['GCP_PROJECT_ID', 'GCP_CREDENTIALS_FILE', 'GCP_MANAGED_ZONE', 'GCP_CHANGE_TIMEOUT'],
+        'F5 GTM': ['F5_HOST', 'F5_USERNAME', 'F5_PASSWORD_FILE', 'F5_PARTITION', 'F5_VERIFY_SSL', 'F5_POOL_NAME', 'F5_PRIMARY_MEMBER', 'F5_DR_MEMBER'],
+        'Infoblox': ['INFOBLOX_HOST', 'INFOBLOX_USERNAME', 'INFOBLOX_PASSWORD_FILE', 'INFOBLOX_WAPI_VERSION', 'INFOBLOX_VERIFY_SSL'],
+        'BIND': ['TSIG_KEYFILE'],
+        'Custom Script': ['SCRIPT_SET', 'SCRIPT_GET'],
+        'Vault': ['VAULT_ADDR', 'VAULT_REQUIRED', 'VAULT_AUTH_METHOD', 'VAULT_ROLE_ID', 'VAULT_TOKEN_FILE', 'VAULT_SECRET_ID_FILE', 'VAULT_MOUNT', 'VAULT_KEY'],
+    }
+
+    written = set()
+    for group, keys in groups.items():
+        group_values = [(key, config.get(key)) for key in keys if config.get(key)]
+        if group_values:
+            write(f"# {group}\n")
+            for key, value in group_values:
+                write(f"{key}={value}\n")
+                written.add(key)
+            write("\n")
+
+    remaining = [(key, value) for key, value in config.items() if key not in written and value]
+    if remaining:
+        write("# Other\n")
+        for key, value in remaining:
+            write(f"{key}={value}\n")
+
+    _atomic_private_write(filename, ''.join(lines))
 def main():
     print_header("AST DNS Failover Setup Wizard")
     
@@ -755,7 +852,10 @@ def main():
     
     config['DNS_ZONE'] = ask("DNS Zone (e.g., example.com)")
     config['DNS_RECORD'] = ask("DNS Record to manage (FQDN)", default=f"failover.{config['DNS_ZONE']}")
-    config['DNS_TTL'] = ask("DNS TTL in seconds", default="30")
+    config['DNS_TTL'] = ask(
+        "DNS TTL in seconds",
+        default="60" if provider == 'cloudflare' else "30",
+    )
     
     # Step 3: Provider-specific setup
     if provider == 'cloudflare':
@@ -791,14 +891,52 @@ def main():
     config['LEASE_TTL'] = ask("Lease TTL (seconds before DR can take over)", default="60")
     config['UPDATE_INTERVAL'] = ask("Update interval (seconds between heartbeats)", default="10")
     config['FAIL_THRESHOLD'] = ask("Fail threshold (consecutive failures before action)", default="3")
+    config['FAILBACK_THRESHOLD'] = ask("Healthy checks before primary reclamation", default="3")
+    config['MAX_CLOCK_SKEW'] = ask("Maximum allowed clock skew in seconds", default="5")
+    config['AUTO_FAILBACK'] = str(
+        ask_bool(
+            "Automatically let DR yield after primary recovery (primary still waits for lease expiry)?",
+            default=False,
+        )
+    ).lower()
+    config['LEASE_PROOF_FILE'] = '/state/observed-lease.json'
     
     # Step 5: Health check
     print_step(5, "Health Check Settings")
     print_info("DR site will check this endpoint to determine if Primary is healthy")
     
-    config['HEALTH_HOST'] = ask("Health check host", default=config['PRIMARY_IP'])
-    config['HEALTH_PORT'] = ask("Health check port", default="6514")
+    config['HEALTH_MODE'] = ask_choice("Health check mode:", [
+        ('http', 'HTTP readiness endpoint (recommended)'),
+        ('tcp', 'TCP port connectivity'),
+        ('metrics', 'Prometheus counter freshness'),
+    ], default='http')
+    if config['HEALTH_MODE'] == 'tcp':
+        config['HEALTH_HOST'] = ask("Health check host", default=config['PRIMARY_IP'])
+        config['HEALTH_PORT'] = ask("Health check port", default="8888")
+    else:
+        config['HEALTH_URL'] = ask(
+            "Primary health URL",
+            default=f"http://{config['PRIMARY_IP']}:8888/metrics",
+        )
+        if config['HEALTH_MODE'] == 'metrics':
+            config['HEALTH_METRIC'] = ask(
+                "Prometheus metric to monitor",
+                default="otelcol_receiver_accepted_metric_points",
+            )
+            config['HEALTH_STALE_COUNT'] = ask("Allowed flat readings", default="3")
     config['HEALTH_TIMEOUT'] = ask("Health check timeout (seconds)", default="2")
+    config['LOCAL_HEALTH_URL'] = ask(
+        "Local backing-service readiness URL",
+        default="http://victoriametrics:8428/health",
+    )
+    primary_failback_health_url = ask(
+        "Primary recovery URL as seen from the primary controller",
+        default="http://victoriametrics:8428/health",
+    )
+    dr_failback_health_url = ask(
+        "Primary recovery URL as seen from the DR controller",
+        default=f"http://{config['PRIMARY_IP']}:8428/health",
+    )
     
     # Step 6: Vault integration (optional)
     print_step(6, "Vault Integration (Optional)")
@@ -806,6 +944,7 @@ def main():
     use_vault = ask_bool("Do you want to use HashiCorp Vault for secrets?", default=False)
     if use_vault:
         config['VAULT_ADDR'] = ask("Vault address (e.g., https://vault.example.com:8200)")
+        config['VAULT_REQUIRED'] = 'true'
         config['VAULT_AUTH_METHOD'] = ask_choice("Authentication method:", [
             ('token', 'Token-based'),
             ('approle', 'AppRole (recommended for production)'),
@@ -837,17 +976,27 @@ def main():
     if output_dir is None:
         output_dir = ask("Output directory", default=".")
     os.makedirs(output_dir, exist_ok=True)
+
+    output_config = config.copy()
+    if use_vault:
+        # Provider credentials belong in Vault; only the bootstrap credential is
+        # materialized locally so it can be mounted as a container secret.
+        for key in SENSITIVE_KEYS - {'VAULT_TOKEN', 'VAULT_SECRET_ID'}:
+            output_config.pop(key, None)
+    output_config = externalize_secrets(output_config, output_dir)
     
     # Primary config
-    primary_config = config.copy()
+    primary_config = output_config.copy()
     primary_config['ROLE'] = 'primary'
+    primary_config['FAILBACK_HEALTH_URL'] = primary_failback_health_url
     primary_file = os.path.join(output_dir, '.env.primary')
     write_env_file(primary_config, primary_file)
     print_success(f"Created {primary_file}")
     
     # DR config
-    dr_config = config.copy()
+    dr_config = output_config.copy()
     dr_config['ROLE'] = 'dr'
+    dr_config['FAILBACK_HEALTH_URL'] = dr_failback_health_url
     dr_file = os.path.join(output_dir, '.env.dr')
     write_env_file(dr_config, dr_file)
     print_success(f"Created {dr_file}")
@@ -866,53 +1015,36 @@ def main():
     
     if provider == 'script':
         print(f"""
-  {YELLOW}IMPORTANT: Customize your scripts first!{RESET}
-  
-  1. Edit {output_dir}/scripts/set_dns.sh for your DNS provider
-  2. Test it manually:
-     ./scripts/set_dns.sh test.example.com 10.10.10.10 primary 9999999999 30 example.com
-  
-  3. Build and run with scripts mounted:
-  
-     # On Primary site:
-     docker build -t dns-failover .
-     docker run -d --name dns-failover \\
-       --env-file .env.primary \\
-       -v $(pwd)/scripts:/scripts \\
-       dns-failover
-     
-     # On DR site:
-     docker build -t dns-failover .
-     docker run -d --name dns-failover \\
-       --env-file .env.dr \\
-       -v $(pwd)/scripts:/scripts \\
-       dns-failover
-  
-  4. Initialize DNS (run once from Primary):
-     docker exec dns-failover python3 /app/dns_failover.py init
-  
-  5. Monitor logs:
-     docker logs -f dns-failover
+  {YELLOW}IMPORTANT: Customize and test {output_dir}/scripts/set_dns.sh before deployment.{RESET}
 """)
-    else:
-        print("""
-  1. Copy .env.primary to your primary site
-  2. Copy .env.dr to your DR site
-  3. Build and run the containers:
-  
-     # On Primary site:
-     docker build -t dns-failover .
-     docker run -d --name dns-failover --env-file .env.primary dns-failover
-     
-     # On DR site:
-     docker build -t dns-failover .
-     docker run -d --name dns-failover --env-file .env.dr dns-failover
-  
-  4. Initialize DNS (run once from Primary):
-     docker exec dns-failover python3 /app/dns_failover.py init
-  
-  5. Monitor logs:
-     docker logs -f dns-failover
+
+    print("""
+  1. Place .env.primary on the primary repository checkout and .env.dr on
+     the DR checkout. Copy the generated secrets/ directory securely to each
+     matching host; never commit those files. Provider credentials are isolated
+     under secrets/failover/, the only host secret directory mounted into the
+     dns-failover controller.
+
+  2. Create the stack-level .env and receiver configuration described in
+     USER_GUIDE.md, then run the preflight on each host:
+
+       sh services/preflight.sh docker-compose.primary.yaml
+       sh services/preflight.sh docker-compose.dr.yaml
+
+  3. Initialize the real DNS lease once, from the primary host, before
+     starting the gated collector:
+
+       docker compose -f docker-compose.primary.yaml run --rm dns-failover init
+
+  4. Start primary first, verify it, and then start DR:
+
+       docker compose -f docker-compose.primary.yaml up -d --build
+       docker compose -f docker-compose.dr.yaml up -d --build
+
+  5. Verify container health and follow the control-plane logs:
+
+       docker compose -f docker-compose.primary.yaml ps
+       docker compose -f docker-compose.primary.yaml logs -f dns-failover otel-watcher
 """)
     
     if use_vault:
@@ -924,7 +1056,8 @@ def main():
       cloudflare_api_token="your-token" \\
       # ... other secrets
       
-  Then remove sensitive values from .env files.
+  Provider credentials are intentionally omitted from the generated env files;
+  keep only the generated Vault bootstrap secret file on each host.
 """)
     
     print_success("Setup complete! Good luck with your failover configuration.")

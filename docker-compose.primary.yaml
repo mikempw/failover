@@ -1,30 +1,48 @@
-# AST Primary Site - Complete Stack
-# 
-# Components:
-#   - VictoriaMetrics (metrics storage)
-#   - ClickHouse (analytics storage)
-#   - OTEL Collector (scrapes BIG-IPs, exports to VM + ClickHouse)
-#   - Grafana (dashboards)
-#   - dns-failover (lease management)
-#   - otel-watcher (controls OTEL based on DNS)
-#   - vm-sync (pulls from DR to fill gaps)
-#
-# Usage:
-#   docker compose -f docker-compose.primary.yaml up -d
+name: ast-primary
+
+x-failover-env: &failover-env
+  - path: ./failover/.env.primary.example
+    required: true
+  - path: ./.env.primary
+    required: false
+  - path: ./failover/.env.primary
+    required: false
+
+x-otel-env: &otel-env
+  - path: ./.env.example
+    required: true
+  - path: ./.env
+    required: false
+  - path: ./failover/.env.primary.example
+    required: true
+  - path: ./.env.primary
+    required: false
+  - path: ./failover/.env.primary
+    required: false
 
 volumes:
   victoriametrics:
   clickhouse:
   grafana:
+  primary_failover_state:
+  primary_vm_sync_state:
 
 networks:
   ast_network:
     driver: bridge
+    ipam:
+      config:
+        - subnet: ${AST_NETWORK_SUBNET:-172.30.0.0/24}
+
+secrets:
+  clickhouse_password:
+    file: ${CLICKHOUSE_PASSWORD_FILE:-./secrets/clickhouse_password.txt}
+  grafana_clickhouse_password:
+    file: ${GRAFANA_CLICKHOUSE_PASSWORD_FILE:-./secrets/grafana_clickhouse_password.txt}
+  grafana_admin_password:
+    file: ${GRAFANA_ADMIN_PASSWORD_FILE:-./secrets/grafana_admin_password.txt}
 
 services:
-  # ===================
-  # METRICS STORAGE
-  # ===================
   victoriametrics:
     image: victoriametrics/victoria-metrics:v1.93.0
     container_name: victoriametrics
@@ -33,135 +51,199 @@ services:
     volumes:
       - victoriametrics:/victoria-metrics-data
     command:
-      - '--storageDataPath=/victoria-metrics-data'
-      - '--retentionPeriod=12'
-      - '--httpListenAddr=:8428'
-      - '--dedup.minScrapeInterval=30s'
+      - --storageDataPath=/victoria-metrics-data
+      - --retentionPeriod=12
+      - --httpListenAddr=:8428
+      - --dedup.minScrapeInterval=30s
     ports:
-      - "8428:8428"
+      - "${BIND_ADDRESS:-127.0.0.1}:8428:8428"
     networks:
       - ast_network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8428/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
 
-  # ===================
-  # ANALYTICS STORAGE
-  # ===================
   clickhouse:
-    image: clickhouse/clickhouse-server:24.1
+    image: clickhouse/clickhouse-server:24.3.18.7
     container_name: clickhouse
     restart: unless-stopped
+    entrypoint: ["/bin/bash", "/usr/local/bin/secure-clickhouse-entrypoint.sh"]
     volumes:
       - clickhouse:/var/lib/clickhouse
       - ./services/clickhouse/config.xml:/etc/clickhouse-server/config.d/custom.xml:ro
       - ./services/clickhouse/users.xml:/etc/clickhouse-server/users.d/custom.xml:ro
+      - ./services/clickhouse/secure-entrypoint.sh:/usr/local/bin/secure-clickhouse-entrypoint.sh:ro
     ports:
-      - "8123:8123"
-      - "9000:9000"
+      - "${BIND_ADDRESS:-127.0.0.1}:8123:8123"
+      - "${BIND_ADDRESS:-127.0.0.1}:9000:9000"
     environment:
-      - CLICKHOUSE_DB=ast
-      - CLICKHOUSE_USER=default
-      - CLICKHOUSE_PASSWORD=
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-ast}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-ast}
+      CLICKHOUSE_PASSWORD_FILE: /run/secrets/clickhouse_password
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+      CLICKHOUSE_INTERNAL_CIDR: ${AST_NETWORK_SUBNET:-172.30.0.0/24}
+      CLICKHOUSE_REMOTE_CIDRS: ${CLICKHOUSE_REMOTE_CIDRS:-}
+      GRAFANA_CLICKHOUSE_USER: ${GRAFANA_CLICKHOUSE_USER-grafana}
+      GRAFANA_CLICKHOUSE_PASSWORD_FILE: /run/secrets/grafana_clickhouse_password
+    secrets:
+      - clickhouse_password
+      - grafana_clickhouse_password
     networks:
       - ast_network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
-  # ===================
-  # TELEMETRY COLLECTOR
-  # ===================
   otel-collector:
-    image: ghcr.io/f5devcentral/application-study-tool/otel_custom_collector:v0.9.6
+    build:
+      context: .
+      dockerfile: services/otel_collector/Dockerfile
+    image: ast-otel-collector
     container_name: application-study-tool-otel-collector-1
     restart: "no"
     volumes:
-      - ./services/otel_collector:/etc/otel-collector-config
+      - ./services/otel_collector:/etc/otel-collector-config:ro
+      - ${OTEL_RECEIVERS_FILE:-./services/otel_collector/receivers.example.yaml}:/run/source-otel-config/receivers.yaml:ro
+      - ${OTEL_SECRETS_DIR:-./services/otel_collector/example-secrets}:/run/source-otel-secrets:ro
+      - primary_failover_state:/state:ro
     command:
-      - "--config=/etc/otel-collector-config/defaults/bigip-scraper-config.yaml"
-    env_file:
-      - ".env"
-      - ".env.device-secrets"
+      - --config=/etc/otel-collector-config/defaults/bigip-scraper-config.yaml
+    env_file: *otel-env
+    environment:
+      CLICKHOUSE_ENDPOINT: tcp://clickhouse:9000
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-ast}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-ast}
+      CLICKHOUSE_PASSWORD_FILE: /run/secrets/clickhouse_password
+      LOCAL_VM_WRITE_URL: http://victoriametrics:8428/api/v1/write
+      PEER_VM_WRITE_URL: ${DR_VM_WRITE_URL:-http://192.0.2.20:8428/api/v1/write}
+    secrets:
+      - clickhouse_password
     ports:
-      - "8888:8888"
-      - "4317:4317"
-      - "4318:4318"
+      - "${BIND_ADDRESS:-127.0.0.1}:8888:8888"
+      - "${BIND_ADDRESS:-127.0.0.1}:4317:4317"
+      - "${BIND_ADDRESS:-127.0.0.1}:4318:4318"
     networks:
       - ast_network
     depends_on:
-      - victoriametrics
-      - clickhouse
+      victoriametrics:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/bin/busybox", "wget", "-q", "--spider", "http://127.0.0.1:8888/metrics"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
-  # ===================
-  # DASHBOARDS
-  # ===================
   grafana:
-    image: grafana/grafana:11.1.0
+    build:
+      context: .
+      dockerfile: services/grafana/Dockerfile
+    image: ast-grafana
     container_name: grafana
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "${BIND_ADDRESS:-127.0.0.1}:3000:3000"
     volumes:
       - grafana:/var/lib/grafana
-      - ./services/grafana/provisioning:/etc/grafana/provisioning
+      - ./services/grafana/provisioning:/etc/grafana/provisioning:ro
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
-      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
-    env_file:
-      - ".env"
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-ast-admin}
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      CLICKHOUSE_USER: ${GRAFANA_CLICKHOUSE_USER-grafana}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-ast}
+      CLICKHOUSE_PASSWORD_FILE: /run/secrets/grafana_clickhouse_password
+    secrets:
+      - grafana_clickhouse_password
+      - grafana_admin_password
     networks:
       - ast_network
     depends_on:
-      - victoriametrics
-      - clickhouse
+      victoriametrics:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 45s
 
-  # ===================
-  # FAILOVER SYSTEM
-  # ===================
   dns-failover:
     build:
-      context: ./failover
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: failover/Dockerfile
     image: dns-failover
     container_name: dns-failover
     restart: unless-stopped
-    env_file:
-      - ./failover/.env.primary
+    env_file: *failover-env
     volumes:
-      - ./failover/state:/state
+      - primary_failover_state:/state
+      - ${FAILOVER_SECRETS_DIR:-./secrets/failover}:/run/source-secrets:ro
+      - ./scripts:/run/source-scripts:ro
     networks:
       - ast_network
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/readyz' % os.getenv('STATUS_PORT', '8080'), timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
 
   otel-watcher:
     build:
-      context: ./failover
-      dockerfile: Dockerfile.otel-watcher-docker
+      context: .
+      dockerfile: failover/Dockerfile.otel-watcher-docker
     image: otel-watcher
     container_name: otel-watcher
     restart: unless-stopped
     network_mode: host
+    env_file: *failover-env
     environment:
-      - DNS_RECORD=failover.mpwlabs.com
-      - MY_IP=192.168.100.144
-      - OTEL_CONTAINER=application-study-tool-otel-collector-1
-      - DNS_SERVER=8.8.8.8
-      - OTEL_CHECK_INTERVAL=15
+      OTEL_CONTAINER: application-study-tool-otel-collector-1
+      OTEL_CHECK_INTERVAL: ${OTEL_CHECK_INTERVAL:-15}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    depends_on:
-      - dns-failover
-      
-  # ===================
-  # REPLICATION: VM Sync (pulls from DR to fill gaps)
-  # ===================
+      - primary_failover_state:/state:ro
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/readyz' % os.getenv('STATUS_PORT', '8080'), timeout=2)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
   vm-sync:
     build:
-      context: ./vm-sync
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: vm-sync/Dockerfile
     image: vm-sync
     container_name: vm-sync
     restart: unless-stopped
     environment:
-      - SOURCE_URL=http://192.168.100.143:8428
-      - DEST_URL=http://victoriametrics:8428
-      - SYNC_INTERVAL=300
-      - SYNC_LOOKBACK=30
+      SOURCE_URL: ${DR_VM_URL:-http://192.0.2.20:8428}
+      DEST_URL: http://victoriametrics:8428
+      SYNC_INTERVAL: ${VM_SYNC_INTERVAL:-300}
+      SYNC_LOOKBACK: ${VM_SYNC_LOOKBACK:-30}
+      SYNC_START_TIMESTAMP: ${VM_SYNC_START_TIMESTAMP:-}
+      HEALTH_PORT: "8080"
+    volumes:
+      - primary_vm_sync_state:/state
     networks:
       - ast_network
     depends_on:
-      - victoriametrics
+      victoriametrics:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/readyz' % os.getenv('HEALTH_PORT', '8080'), timeout=2)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s

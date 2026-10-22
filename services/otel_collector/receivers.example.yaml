@@ -1,0 +1,22 @@
+# Configuration-valid TEST-NET receiver. Generate or supply a real
+# receivers.yaml through OTEL_RECEIVERS_FILE before production deployment.
+bigip:
+  collection_interval: 24h
+  endpoint: https://192.0.2.1
+  username: replace-me
+  password: ${file:/run/runtime-secrets/bigip_password}
+  data_types:
+    f5.dns:
+      enabled: false
+    f5.gtm:
+      enabled: false
+  tls:
+    ca_file: /etc/ssl/certs/ca-certificates.pem
+    insecure_skip_verify: false
+
+otlp:
+  protocols:
+    grpc:
+      endpoint: 0.0.0.0:4317
+    http:
+      endpoint: 0.0.0.0:4318

@@ -1,0 +1,1 @@
+"""DNS failover service package."""
